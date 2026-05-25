@@ -972,6 +972,10 @@ class SarvamTTSService(InterruptibleTTSService):
 
         self._receive_task = None
         self._keepalive_task = None
+        # Holds the background connect task started in start() so StartFrame
+        # propagation isn't blocked by the websocket handshake. run_tts()
+        # awaits it (via _ensure_connected) before sending the first text.
+        self._start_connect_task = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -1002,7 +1006,26 @@ class SarvamTTSService(InterruptibleTTSService):
 
         # WebSocket API expects sample rate as string
         self._speech_sample_rate = str(self.sample_rate)
-        await self._connect()
+        # Connect in the background so StartFrame propagation (and the
+        # downstream greeting) isn't blocked by the ~0.8s websocket handshake.
+        # run_tts() gates on readiness before sending the first text.
+        self._start_connect_task = self.create_task(self._connect())
+
+    async def _ensure_connected(self):
+        """Await the background connect started in start(), if still pending."""
+        task = self._start_connect_task
+        if task is not None:
+            self._start_connect_task = None
+            try:
+                await task
+            except Exception as e:
+                logger.error(f"{self} background connect failed: {e}")
+
+    async def _cancel_start_connect(self):
+        """Cancel a still-pending background connect during teardown."""
+        if self._start_connect_task is not None:
+            await self.cancel_task(self._start_connect_task)
+            self._start_connect_task = None
 
     async def stop(self, frame: EndFrame):
         """Stop the Sarvam TTS service.
@@ -1011,6 +1034,7 @@ class SarvamTTSService(InterruptibleTTSService):
             frame: The end frame.
         """
         await super().stop(frame)
+        await self._cancel_start_connect()
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
@@ -1020,6 +1044,7 @@ class SarvamTTSService(InterruptibleTTSService):
             frame: The cancel frame.
         """
         await super().cancel(frame)
+        await self._cancel_start_connect()
         await self._disconnect()
 
     async def flush_audio(self, context_id: Optional[str] = None):
@@ -1214,6 +1239,10 @@ class SarvamTTSService(InterruptibleTTSService):
         if not any(ch.isalnum() for ch in text):
             logger.debug(f"Skipping TTS for text with no synthesizable characters: [{text}]")
             return
+
+        # Wait for the background connect (started in start()) before sending,
+        # so the first utterance doesn't race it into a duplicate connect.
+        await self._ensure_connected()
 
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
