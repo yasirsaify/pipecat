@@ -320,6 +320,10 @@ class SarvamSTTService(STTService):
         self._websocket_context = None
         self._socket_client = None
         self._receive_task = None
+        # Holds the background connect task started in start() so that
+        # StartFrame propagation isn't blocked by the websocket handshake.
+        # run_stt() awaits it (via _ensure_connected) before sending audio.
+        self._start_connect_task = None
 
         if default_settings.vad_signals:
             self._register_event_handler("on_speech_started")
@@ -450,7 +454,26 @@ class SarvamSTTService(STTService):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
-        await self._connect()
+        # Connect in the background so StartFrame propagation (and the
+        # downstream greeting) isn't blocked by the ~0.8s websocket handshake.
+        # run_stt() gates on readiness before sending the first audio.
+        self._start_connect_task = self.create_task(self._connect())
+
+    async def _ensure_connected(self):
+        """Await the background connect started in start(), if still pending."""
+        task = self._start_connect_task
+        if task is not None:
+            self._start_connect_task = None
+            try:
+                await task
+            except Exception as e:
+                logger.error(f"{self} background connect failed: {e}")
+
+    async def _cancel_start_connect(self):
+        """Cancel a still-pending background connect during teardown."""
+        if self._start_connect_task is not None:
+            await self.cancel_task(self._start_connect_task)
+            self._start_connect_task = None
 
     async def stop(self, frame: EndFrame):
         """Stop the Sarvam STT service.
@@ -459,6 +482,7 @@ class SarvamSTTService(STTService):
             frame: The end frame.
         """
         await super().stop(frame)
+        await self._cancel_start_connect()
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
@@ -468,6 +492,7 @@ class SarvamSTTService(STTService):
             frame: The cancel frame.
         """
         await super().cancel(frame)
+        await self._cancel_start_connect()
         await self._disconnect()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
@@ -479,6 +504,10 @@ class SarvamSTTService(STTService):
         Yields:
             Frame: None (transcription results come via WebSocket callbacks).
         """
+        # Wait for the background connect (started in start()) to finish before
+        # the first send, so the user's opening words aren't silently dropped.
+        await self._ensure_connected()
+
         if not self._socket_client:
             yield None
             return
