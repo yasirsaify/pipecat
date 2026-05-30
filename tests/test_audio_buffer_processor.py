@@ -7,6 +7,7 @@
 import asyncio
 import struct
 import unittest
+import unittest.mock
 
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
@@ -322,6 +323,120 @@ class TestSilenceInjectionGuards(unittest.IsolatedAsyncioTestCase):
         await p.cleanup()
 
         self.assertEqual(user_track[:8], b"\x00" * 8)
+
+
+class _FakeMonotonic:
+    """Controllable replacement for time.monotonic()."""
+
+    def __init__(self, start: float = 1000.0):
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class TestTimelineRecording(unittest.IsolatedAsyncioTestCase):
+    """Clock-anchored recording: inbound placed by carrier timestamp, outbound by
+    monotonic arrival. This decouples the recording from frame-arrival cadence so
+    bursty delivery after an event-loop stall can no longer chop tracks with
+    injected silence.
+
+    All assertions use 16kHz/16-bit mono tracks: 1 second = 32000 bytes, so
+    20ms = 640 bytes.
+    """
+
+    SR = 16000  # bytes per 20ms = SR * 0.02 * 2 = 640
+
+    async def _make_timeline_processor(self, clock: _FakeMonotonic, *, buffer_size: int = 0):
+        # Patch the module clock before start_recording so _rec_start_mono is the
+        # fake origin, and keep it patched for the lifetime of the returned
+        # processor (caller stays inside the patch context).
+        processor = await _make_processor(buffer_size=buffer_size)
+        # _make_processor already called start_recording() under the patch, but to
+        # be explicit and robust set the recording origin to the fake start.
+        processor._rec_start_mono = clock.value
+        return processor
+
+    async def test_inbound_placed_by_carrier_timestamp_with_gap_as_silence(self):
+        """Burst-delivered user frames land at spaced positions per carrier ts, and a
+        real gap in carrier timestamps becomes exactly that much silence."""
+        clock = _FakeMonotonic(1000.0)
+        with unittest.mock.patch(
+            "pipecat.processors.audio.audio_buffer_processor.time.monotonic", new=clock
+        ):
+            p = await self._make_timeline_processor(clock)
+
+            f1 = b"\x11" * 640  # carrier 0.00 - 0.02
+            f2 = b"\x22" * 640  # carrier 0.02 - 0.04
+            f3 = b"\x33" * 640  # carrier 0.06 - 0.08 (20ms gap after f2)
+
+            # All three arrive in the same instant (a burst after a stall):
+            # the fake clock never advances.
+            for audio, ts in ((f1, 0.00), (f2, 0.02), (f3, 0.06)):
+                frame = InputAudioRawFrame(audio=audio, sample_rate=self.SR, num_channels=1)
+                frame.metadata["recording_ts"] = ts
+                await p.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            self.assertTrue(p._timeline_enabled)
+            user_track, _ = await _capture_track_audio(p)
+            await p.cleanup()
+
+        # f1, f2 contiguous; 640 bytes (20ms) of silence for the carrier gap; then f3.
+        self.assertEqual(user_track, f1 + f2 + (b"\x00" * 640) + f3)
+
+    async def test_outbound_placed_by_monotonic_arrival(self):
+        """Bot frames are positioned by monotonic arrival relative to recording start,
+        so a real-time gap becomes silence and consecutive frames stay contiguous."""
+        clock = _FakeMonotonic(1000.0)
+        with unittest.mock.patch(
+            "pipecat.processors.audio.audio_buffer_processor.time.monotonic", new=clock
+        ):
+            p = await self._make_timeline_processor(clock)
+
+            # Latch timeline mode with a timestamped inbound frame at t=0.
+            latch = InputAudioRawFrame(audio=b"\x01" * 640, sample_rate=self.SR, num_channels=1)
+            latch.metadata["recording_ts"] = 0.0
+            await p.process_frame(latch, FrameDirection.DOWNSTREAM)
+
+            b1 = b"\xaa" * 640  # arrives at t=0.04 (40ms after start)
+            clock.value = 1000.04
+            await p.process_frame(
+                OutputAudioRawFrame(audio=b1, sample_rate=self.SR, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            b2 = b"\xbb" * 640  # arrives at t=0.06 (contiguous with b1)
+            clock.value = 1000.06
+            await p.process_frame(
+                OutputAudioRawFrame(audio=b2, sample_rate=self.SR, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+
+            _, bot_track = await _capture_track_audio(p)
+            await p.cleanup()
+
+        # 40ms (1280 bytes) leading silence (bot silent until t=0.04), then b1, b2 back-to-back.
+        self.assertEqual(bot_track, (b"\x00" * 1280) + b1 + b2)
+
+    async def test_legacy_mode_unchanged_without_timestamps(self):
+        """Inbound frames with no carrier timestamp keep the legacy append behavior:
+        burst frames are concatenated (no timeline gaps), timeline stays disabled."""
+        p = await _make_processor(buffer_size=0)
+
+        f1 = b"\x11" * 640
+        f2 = b"\x22" * 640
+        f3 = b"\x33" * 640
+        for audio in (f1, f2, f3):
+            await p.process_frame(
+                InputAudioRawFrame(audio=audio, sample_rate=self.SR, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+
+        self.assertFalse(p._timeline_enabled)
+        user_track, _ = await _capture_track_audio(p)
+        await p.cleanup()
+
+        # Legacy: contiguous append, no carrier-driven gap silence.
+        self.assertEqual(user_track, f1 + f2 + f3)
 
 
 if __name__ == "__main__":

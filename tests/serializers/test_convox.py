@@ -116,6 +116,53 @@ async def test_deserialize_media_returns_input_audio_raw_frame():
     assert frame.num_channels == 1
     assert isinstance(frame.audio, (bytes, bytearray))
     assert len(frame.audio) > 0
+    # Carrier timestamp (ms) is exposed to the recorder as metadata["recording_ts"]
+    # in seconds so inbound audio can be placed on a real time axis.
+    assert frame.metadata.get("recording_ts") == 1700000000000 / 1000.0
+
+
+@pytest.mark.asyncio
+async def test_deserialize_media_without_timestamp_omits_recording_ts():
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    msg = json.dumps(
+        {
+            "event": "media",
+            "sequence_number": 6,
+            "stream_sid": STREAM_SID,
+            "media": {
+                "chunk": 6,
+                "payload": _pcm_payload(),
+            },
+        }
+    )
+    frame = await serializer.deserialize(msg)
+    assert isinstance(frame, InputAudioRawFrame)
+    # No carrier timestamp -> no recording_ts; recorder falls back to legacy mode.
+    assert "recording_ts" not in frame.metadata
+
+
+@pytest.mark.asyncio
+async def test_deserialize_media_invalid_timestamp_omits_recording_ts():
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    msg = json.dumps(
+        {
+            "event": "media",
+            "sequence_number": 7,
+            "stream_sid": STREAM_SID,
+            "media": {
+                "chunk": 7,
+                "timestamp": "not-a-number",
+                "payload": _pcm_payload(),
+            },
+        }
+    )
+    frame = await serializer.deserialize(msg)
+    assert isinstance(frame, InputAudioRawFrame)
+    assert "recording_ts" not in frame.metadata
 
 
 @pytest.mark.asyncio

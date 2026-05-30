@@ -11,6 +11,7 @@ of audio from both user input and bot output sources, with support for various a
 configurations and event-driven processing.
 """
 
+import time
 from typing import Optional
 
 from loguru import logger
@@ -100,6 +101,25 @@ class AudioBufferProcessor(FrameProcessor):
         self._user_audio_buffer = bytearray()
         self._bot_audio_buffer = bytearray()
 
+        # --- Timeline (clock-anchored) recording state -------------------------
+        # When inbound audio frames carry an authoritative capture timestamp
+        # (metadata["recording_ts"], in seconds), we place each track on a real
+        # time axis instead of appending by arrival order. This prevents bursty
+        # frame delivery (e.g. after an event-loop stall) from chopping the bot
+        # track with silence mid-utterance. Auto-enables on the first timestamped
+        # inbound frame; otherwise the legacy byte-append path is used unchanged.
+        self._timeline_enabled = False
+        # Monotonic time captured at start_recording; the shared recording axis
+        # origin for both tracks.
+        self._rec_start_mono: Optional[float] = None
+        # Bytes of (aligned) audio already flushed via on_audio_data. Absolute
+        # timeline positions are converted to current-buffer offsets by
+        # subtracting this baseline.
+        self._timeline_base_bytes = 0
+        # Bridge from the inbound source clock (carrier ms) to the recording
+        # axis: (first_carrier_ts_seconds, axis_offset_seconds).
+        self._in_ts_origin: Optional[tuple[float, float]] = None
+
         self._user_speaking = False
         self._bot_speaking = False
         self._user_turn_audio_buffer = bytearray()
@@ -167,6 +187,7 @@ class AudioBufferProcessor(FrameProcessor):
         Initializes recording state and resets audio buffers.
         """
         self._recording = True
+        self._rec_start_mono = time.monotonic()
         self._reset_recording()
 
     async def stop_recording(self):
@@ -217,50 +238,85 @@ class AudioBufferProcessor(FrameProcessor):
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
 
+        # Latch timeline (clock-anchored) recording on the first inbound frame
+        # that carries an authoritative capture timestamp. Until then (or forever,
+        # for transports that never provide one) the legacy byte-append path runs
+        # unchanged.
+        if (
+            not self._timeline_enabled
+            and isinstance(frame, InputAudioRawFrame)
+            and frame.metadata.get("recording_ts") is not None
+        ):
+            self._timeline_enabled = True
+
         resampled = None
         if isinstance(frame, InputAudioRawFrame):
             resampled = await self._resample_input_audio(frame)
             # Ignoring in case we don't have audio
             if len(resampled) > 0:
-                # Sync bot buffer to current user position before adding user audio.
-                # We sync BEFORE extending to align both buffers at the same starting timestamp.
-                # For example, user buffer is at 100 bytes, and you receive 20 bytes of new audio
-                #  - Bot buffer sees User is at 100. Bot pads itself to 100.
-                #  - User buffer adds 20. User is now at 120.
-                #  - Outcome: At index 100-120, we have User Audio and (potentially) Bot Audio or silence. They are aligned
-                # This gives the opportunity to the bot to send audio.
-                #
-                # If we synced AFTER, we'd pad the bot buffer with silence for the same
-                # window we just gave to the user, effectively "overwriting" that time slot
-                # with silence and causing the bot's audio to flicker or cut out.
-                #
-                # Skip silence injection if the bot is actively speaking to avoid
-                # inserting silence in the middle of a bot utterance (causes crackling).
-                if not self._bot_speaking:
-                    self._sync_buffer_to_position(
-                        self._bot_audio_buffer, len(self._user_audio_buffer)
+                if self._timeline_enabled:
+                    # Place the user chunk at its true capture time on the
+                    # recording axis (immune to bursty arrival after a stall).
+                    self._place_timeline_audio(
+                        self._user_audio_buffer,
+                        resampled,
+                        self._input_timeline_position(frame),
                     )
-                # Add user audio.
-                self._user_audio_buffer.extend(resampled)
+                else:
+                    # Sync bot buffer to current user position before adding user audio.
+                    # We sync BEFORE extending to align both buffers at the same starting timestamp.
+                    # For example, user buffer is at 100 bytes, and you receive 20 bytes of new audio
+                    #  - Bot buffer sees User is at 100. Bot pads itself to 100.
+                    #  - User buffer adds 20. User is now at 120.
+                    #  - Outcome: At index 100-120, we have User Audio and (potentially) Bot Audio or silence. They are aligned
+                    # This gives the opportunity to the bot to send audio.
+                    #
+                    # If we synced AFTER, we'd pad the bot buffer with silence for the same
+                    # window we just gave to the user, effectively "overwriting" that time slot
+                    # with silence and causing the bot's audio to flicker or cut out.
+                    #
+                    # Skip silence injection if the bot is actively speaking to avoid
+                    # inserting silence in the middle of a bot utterance (causes crackling).
+                    if not self._bot_speaking:
+                        self._sync_buffer_to_position(
+                            self._bot_audio_buffer, len(self._user_audio_buffer)
+                        )
+                    # Add user audio.
+                    self._user_audio_buffer.extend(resampled)
         elif isinstance(frame, OutputAudioRawFrame):
             resampled = await self._resample_output_audio(frame)
             # Ignoring in case we don't have audio
             if len(resampled) > 0:
-                # Sync user buffer to current bot position before adding bot audio.
-                # Skip silence injection if the user is actively speaking to avoid
-                # inserting silence in the middle of a user utterance (causes crackling).
-                if not self._user_speaking:
-                    self._sync_buffer_to_position(
-                        self._user_audio_buffer, len(self._bot_audio_buffer)
+                if self._timeline_enabled:
+                    # Output frames reach us right after the transport's
+                    # real-time pacing sleep, so monotonic arrival is a faithful
+                    # clock for the bot track.
+                    self._place_timeline_audio(
+                        self._bot_audio_buffer,
+                        resampled,
+                        self._output_timeline_position(),
                     )
-                # Add bot audio.
-                self._bot_audio_buffer.extend(resampled)
+                else:
+                    # Sync user buffer to current bot position before adding bot audio.
+                    # Skip silence injection if the user is actively speaking to avoid
+                    # inserting silence in the middle of a user utterance (causes crackling).
+                    if not self._user_speaking:
+                        self._sync_buffer_to_position(
+                            self._user_audio_buffer, len(self._bot_audio_buffer)
+                        )
+                    # Add bot audio.
+                    self._bot_audio_buffer.extend(resampled)
 
         if self._buffer_size > 0 and (
             len(self._user_audio_buffer) >= self._buffer_size
             or len(self._bot_audio_buffer) >= self._buffer_size
         ):
             await self._call_on_audio_data_handler()
+            if self._timeline_enabled:
+                # Both tracks are equal length after alignment in the handler;
+                # advance the flushed-bytes baseline so absolute timeline
+                # positions keep mapping into the freshly reset buffers.
+                self._timeline_base_bytes += len(self._user_audio_buffer)
             self._reset_primary_audio_buffers()
 
         # Process turn recording with preprocessed data.
@@ -281,6 +337,58 @@ class AudioBufferProcessor(FrameProcessor):
         if current_len < target_position:
             silence_needed = target_position - current_len
             buffer.extend(b"\x00" * silence_needed)
+
+    def _seconds_to_byte_position(self, pos_sec: float) -> int:
+        """Convert a time offset (seconds) to an absolute byte position.
+
+        Track buffers hold mono 16-bit PCM (2 bytes/sample), so positions are
+        sample-aligned (always even). Negative offsets are clamped to 0.
+        """
+        sample_pos = max(0, round(pos_sec * self._sample_rate))
+        return sample_pos * 2
+
+    def _input_timeline_position(self, frame: InputAudioRawFrame) -> int:
+        """Absolute byte position for an inbound (user) audio chunk.
+
+        Uses the carrier capture timestamp (metadata["recording_ts"], seconds)
+        bridged to the recording axis via the first inbound frame, so spacing is
+        faithful to real time regardless of arrival jitter or event-loop stalls.
+        Frames without a timestamp are appended at the current position.
+        """
+        carrier_ts = frame.metadata.get("recording_ts")
+        if carrier_ts is None:
+            return self._timeline_base_bytes + len(self._user_audio_buffer)
+        if self._in_ts_origin is None:
+            rec_start = self._rec_start_mono if self._rec_start_mono is not None else time.monotonic()
+            axis_offset = time.monotonic() - rec_start
+            self._in_ts_origin = (carrier_ts, axis_offset)
+        origin_ts, axis_offset = self._in_ts_origin
+        pos_sec = axis_offset + (carrier_ts - origin_ts)
+        return self._seconds_to_byte_position(pos_sec)
+
+    def _output_timeline_position(self) -> int:
+        """Absolute byte position for an outbound (bot) audio chunk.
+
+        Output frames are pushed downstream immediately after the transport's
+        real-time pacing sleep, so monotonic arrival relative to the recording
+        start is a faithful real-time clock for the bot track.
+        """
+        rec_start = self._rec_start_mono if self._rec_start_mono is not None else time.monotonic()
+        return self._seconds_to_byte_position(time.monotonic() - rec_start)
+
+    def _place_timeline_audio(self, buffer: bytearray, data: bytes, abs_pos_bytes: int):
+        """Place audio at an absolute timeline position in the current chunk.
+
+        Pads with silence when the target is ahead of the buffer (a real gap in
+        the stream) and never moves backwards: a frame whose timeline position
+        falls before the current buffer end (rounding/jitter) is appended
+        contiguously rather than overwriting existing audio.
+        """
+        local_pos = abs_pos_bytes - self._timeline_base_bytes
+        target = max(local_pos, len(buffer))
+        if len(buffer) < target:
+            buffer.extend(b"\x00" * (target - len(buffer)))
+        buffer.extend(data)
 
     async def _process_turn_recording(self, frame: Frame, resampled_audio: Optional[bytes] = None):
         """Process frames for turn-based audio recording."""
@@ -344,6 +452,12 @@ class AudioBufferProcessor(FrameProcessor):
     def _reset_recording(self):
         """Reset recording state and buffers."""
         self._reset_all_audio_buffers()
+        # Reset timeline bookkeeping. The enabled latch and origin are cleared so
+        # a fresh recording re-derives them; _rec_start_mono is set by
+        # start_recording() just before this call.
+        self._timeline_enabled = False
+        self._timeline_base_bytes = 0
+        self._in_ts_origin = None
 
     def _reset_all_audio_buffers(self):
         """Reset all audio buffers to empty state."""

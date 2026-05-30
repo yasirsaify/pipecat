@@ -297,8 +297,24 @@ class ConVoxFrameSerializer(FrameSerializer):
         event = message.get("event")
 
         if event == "media":
-            payload_base64 = message.get("media", {}).get("payload", "")
+            media = message.get("media", {})
+            payload_base64 = media.get("payload", "")
             payload = base64.b64decode(payload_base64)
+
+            # Carrier-provided timestamp for this audio chunk (milliseconds since
+            # the start of the media stream). This is an authoritative clock from
+            # ConVox that is independent of our event loop, so it is the only
+            # reliable timing source for placing inbound audio in the recording
+            # even when the server stalls. Parse it here and hand it to the
+            # AudioBufferProcessor via frame metadata (key "recording_ts",
+            # in seconds). Falls back to None when absent/malformed.
+            carrier_ts_s: Optional[float] = None
+            raw_ts = media.get("timestamp")
+            if raw_ts is not None:
+                try:
+                    carrier_ts_s = int(raw_ts) / 1000.0
+                except (TypeError, ValueError):
+                    carrier_ts_s = None
 
             # Input: ConVox sends raw 16-bit little-endian PCM. Resample from
             # ConVox's sample rate to the pipeline input rate. Do NOT use μ-law
@@ -348,11 +364,14 @@ class ConVoxFrameSerializer(FrameSerializer):
                     f"(dropped={self._out_audio_dropped})"
                 )
 
-            return InputAudioRawFrame(
+            input_frame = InputAudioRawFrame(
                 audio=deserialized_data,
                 num_channels=1,
                 sample_rate=self._sample_rate,
             )
+            if carrier_ts_s is not None:
+                input_frame.metadata["recording_ts"] = carrier_ts_s
+            return input_frame
         elif event == "dtmf":
             digit = message.get("dtmf", {}).get("digit")
             try:
