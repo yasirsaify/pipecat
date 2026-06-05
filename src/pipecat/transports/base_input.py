@@ -90,6 +90,17 @@ class BaseInputTransport(FrameProcessor):
         self._post_bot_stop_mute_until_ts = 0.0
         self._post_bot_stop_mute_dropped = 0
 
+        # Drop accounting for the other two ways inbound audio can be
+        # silently discarded before it reaches the queue (and therefore
+        # before STT and the recording). These were previously invisible;
+        # logging them lets a missing-audio report be pinned to an exact
+        # cause: post-bot-stop mute window vs. paused transport vs. a filter
+        # zeroing the audio vs. nothing here (→ loss is upstream, on the wire).
+        self._audio_in_received = 0
+        self._paused_dropped = 0
+        self._audio_disabled_dropped = 0
+        self._audio_filter_emptied = 0
+
         # Track user speaking state for interruption logic
         self._user_speaking = False
         # Last time a UserSpeakingFrame was pushed.
@@ -336,27 +347,65 @@ class BaseInputTransport(FrameProcessor):
         Args:
             frame: The input audio frame to process.
         """
-        if self._params.audio_in_enabled and not self._paused:
-            # Post-bot-stop mute window: drop frames if we're still inside
-            # the echo-suppression window after the bot stopped speaking.
-            # Periodic log so the behavior is observable without flooding.
+        if not self._params.audio_in_enabled:
+            self._audio_disabled_dropped += 1
+            if self._audio_disabled_dropped == 1 or self._audio_disabled_dropped % 200 == 0:
+                logger.debug(
+                    f"BaseInputTransport: dropping inbound audio frame "
+                    f"#{self._audio_disabled_dropped} (audio_in_enabled=False)"
+                )
+            return
+
+        if self._paused:
+            # The transport was paused by a StopFrame and is waiting for a
+            # StartFrame. Any audio that arrives in this window is gone from
+            # BOTH STT and the recording. If this fires mid-call it explains a
+            # block of missing user speech — WARNING (not debug) so it stands
+            # out against a missing-audio report.
+            self._paused_dropped += 1
+            if self._paused_dropped == 1 or self._paused_dropped % 50 == 0:
+                logger.warning(
+                    f"BaseInputTransport: dropping inbound audio frame "
+                    f"#{self._paused_dropped} — transport PAUSED (StopFrame "
+                    f"received, awaiting StartFrame); absent from STT and recording"
+                )
+            return
+
+        # Post-bot-stop mute window: drop frames if we're still inside
+        # the echo-suppression window after the bot stopped speaking.
+        # Periodic log so the behavior is observable without flooding.
+        if (
+            self._post_bot_stop_mute_until_ts
+            and time.monotonic() < self._post_bot_stop_mute_until_ts
+        ):
+            self._post_bot_stop_mute_dropped += 1
             if (
-                self._post_bot_stop_mute_until_ts
-                and time.monotonic() < self._post_bot_stop_mute_until_ts
+                self._post_bot_stop_mute_dropped == 1
+                or self._post_bot_stop_mute_dropped % 50 == 0
             ):
-                self._post_bot_stop_mute_dropped += 1
-                if (
-                    self._post_bot_stop_mute_dropped == 1
-                    or self._post_bot_stop_mute_dropped % 50 == 0
-                ):
-                    remaining = self._post_bot_stop_mute_until_ts - time.monotonic()
-                    logger.debug(
-                        f"BaseInputTransport: dropping inbound audio frame "
-                        f"#{self._post_bot_stop_mute_dropped} in post-bot-stop "
-                        f"mute window (remaining={remaining * 1000:.0f}ms)"
-                    )
-                return
-            await self._audio_in_queue.put(frame)
+                remaining = self._post_bot_stop_mute_until_ts - time.monotonic()
+                logger.debug(
+                    f"BaseInputTransport: dropping inbound audio frame "
+                    f"#{self._post_bot_stop_mute_dropped} in post-bot-stop "
+                    f"mute window (remaining={remaining * 1000:.0f}ms)"
+                )
+            return
+
+        # The mute window has elapsed (or was never armed). If it just closed
+        # after dropping frames, emit a one-line summary of how much user audio
+        # it swallowed, then disarm so the summary fires once per window.
+        if self._post_bot_stop_mute_until_ts:
+            if self._post_bot_stop_mute_dropped:
+                logger.debug(
+                    f"BaseInputTransport: post-bot-stop mute window closed — "
+                    f"dropped {self._post_bot_stop_mute_dropped} inbound frames "
+                    f"(~{self._post_bot_stop_mute_dropped * 20}ms at 20ms/frame)"
+                )
+            self._post_bot_stop_mute_until_ts = 0.0
+            self._post_bot_stop_mute_dropped = 0
+
+        self._audio_in_received += 1
+        await self._audio_in_queue.put(frame)
 
     #
     # Frame processor
@@ -384,6 +433,12 @@ class BaseInputTransport(FrameProcessor):
             # Bot has started speaking: any post-bot-stop mute window from
             # the previous turn is now irrelevant — clear it so we don't
             # accidentally swallow the user's interrupt of this new turn.
+            if self._post_bot_stop_mute_dropped:
+                logger.debug(
+                    f"BaseInputTransport: post-bot-stop mute window cleared by "
+                    f"bot start after dropping {self._post_bot_stop_mute_dropped} "
+                    f"inbound frames"
+                )
             self._post_bot_stop_mute_until_ts = 0.0
             self._post_bot_stop_mute_dropped = 0
             await self._deprecated_handle_bot_started_speaking(frame)
@@ -396,6 +451,10 @@ class BaseInputTransport(FrameProcessor):
                     time.monotonic() + self._post_bot_stop_mute_seconds
                 )
                 self._post_bot_stop_mute_dropped = 0
+                logger.debug(
+                    f"BaseInputTransport: armed post-bot-stop mute window "
+                    f"({self._post_bot_stop_mute_seconds * 1000:.0f}ms) on bot stop"
+                )
             await self._deprecated_handle_bot_stopped_speaking(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, EmulateUserStartedSpeakingFrame):
@@ -471,7 +530,22 @@ class BaseInputTransport(FrameProcessor):
                     frame.audio = await self._params.audio_in_filter.filter(frame.audio)
 
                 # Skip frames with no audio data (e.g. filter is buffering).
+                # If an audio_in_filter is active and repeatedly empties frames
+                # it removes that speech from STT and the recording alike, so
+                # surface it (rate-limited) for missing-audio diagnosis.
                 if not frame.audio:
+                    self._audio_filter_emptied += 1
+                    if (
+                        self._audio_filter_emptied == 1
+                        or self._audio_filter_emptied % 100 == 0
+                    ):
+                        logger.debug(
+                            f"BaseInputTransport: inbound frame "
+                            f"#{self._audio_filter_emptied} has empty audio after "
+                            f"input stage (audio_in_filter="
+                            f"{'set' if self._params.audio_in_filter else 'none'}); "
+                            f"absent from STT and recording"
+                        )
                     self._audio_in_queue.task_done()
                     continue
 
