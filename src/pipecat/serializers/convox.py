@@ -98,6 +98,19 @@ class ConVoxFrameSerializer(FrameSerializer):
         self._out_audio_dropped = 0
         self._in_audio_received = 0
         self._in_audio_dropped = 0
+        # Inbound inter-frame gap detection. ConVox streams media at a fixed
+        # cadence (~20 ms/frame), so a silent stretch longer than the
+        # threshold means the carrier itself stopped sending audio. This is
+        # the prime suspect for user speech that is missing from BOTH the
+        # transcript and the recording: a *pipeline* drop (mute window, paused
+        # transport) shows up downstream while frames keep arriving here on
+        # cadence, whereas a *carrier* gap shows up only here. Threshold of
+        # 150 ms ≈ 7 missed frames — above normal network jitter, below the
+        # 200-400 ms mid-word gaps we're hunting.
+        self._in_gap_warn_s = 0.15
+        self._last_in_media_ts = 0.0
+        self._in_gap_count = 0
+        self._in_gap_max_ms = 0.0
         # Per-frame detailed logging window: log every frame for the first
         # N frames in each direction so timestamps/sequences can be
         # correlated against ConVox-side logs.
@@ -147,6 +160,8 @@ class ConVoxFrameSerializer(FrameSerializer):
                     f"(dropped={self._out_audio_dropped}), "
                     f"inbound_audio_received={self._in_audio_received} "
                     f"(dropped={self._in_audio_dropped}), "
+                    f"inbound_gaps={self._in_gap_count} "
+                    f"(max={self._in_gap_max_ms:.0f}ms), "
                     f"final_seq={self._sequence_number}, final_chunk={self._chunk}, "
                     f"hangup_attempted={self._hangup_attempted}"
                 )
@@ -318,6 +333,30 @@ class ConVoxFrameSerializer(FrameSerializer):
                 return None
 
             self._in_audio_received += 1
+
+            # Inbound inter-frame gap detection (see __init__ for rationale).
+            # A WARNING here that lines up with a missing-audio timestamp means
+            # the carrier stopped sending — i.e. the loss is upstream of us
+            # (network / ConVox), not a pipeline or deployment regression.
+            now_mono = time.monotonic()
+            if (
+                self._last_in_media_ts
+                and (now_mono - self._last_in_media_ts) >= self._in_gap_warn_s
+            ):
+                gap_ms = (now_mono - self._last_in_media_ts) * 1000.0
+                self._in_gap_count += 1
+                if gap_ms > self._in_gap_max_ms:
+                    self._in_gap_max_ms = gap_ms
+                logger.warning(
+                    f"ConVox serializer: inbound audio GAP of {gap_ms:.0f}ms "
+                    f"before frame #{self._in_audio_received} — carrier stopped "
+                    f"sending (normal cadence ~20ms). stream_sid={self._stream_sid}, "
+                    f"gap_count={self._in_gap_count}, "
+                    f"max_gap_ms={self._in_gap_max_ms:.0f}, "
+                    f"wallclock_ms={int(time.time() * 1000)}"
+                )
+            self._last_in_media_ts = now_mono
+
             if self._in_audio_received <= self._detailed_log_first_n:
                 logger.debug(
                     f"ConVox serializer: inbound frame #{self._in_audio_received} — "
@@ -344,6 +383,8 @@ class ConVoxFrameSerializer(FrameSerializer):
                     f"stream_sid={self._stream_sid}, "
                     f"in_received={self._in_audio_received} "
                     f"(dropped={self._in_audio_dropped}), "
+                    f"in_gaps={self._in_gap_count} "
+                    f"(max={self._in_gap_max_ms:.0f}ms), "
                     f"out_serialized={self._out_audio_serialized} "
                     f"(dropped={self._out_audio_dropped})"
                 )

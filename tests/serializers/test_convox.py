@@ -359,3 +359,69 @@ async def test_per_frame_inbound_log_is_debug_not_info():
 
     assert any("inbound frame #1" in m for m in _logged_messages(mock_logger, "debug"))
     assert not any("inbound frame #" in m for m in _logged_messages(mock_logger, "info"))
+
+
+def _media_message() -> str:
+    return json.dumps(
+        {
+            "event": "media",
+            "sequence_number": 5,
+            "stream_sid": STREAM_SID,
+            "media": {
+                "chunk": 5,
+                "timestamp": "1700000000000",
+                "payload": _pcm_payload(),
+            },
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_gap_detection_warns_on_silence():
+    """A silent stretch > threshold between media frames logs a GAP warning.
+
+    This is the discriminator for user audio that is missing from both the
+    transcript and the recording: a carrier-side gap surfaces here, while a
+    pipeline drop does not (frames keep arriving on cadence).
+    """
+    serializer = _make_serializer()
+    await _setup(serializer)
+    media = _media_message()
+
+    # Control the monotonic clock so the gap is deterministic, independent of
+    # how fast the test actually runs.
+    clock = {"t": 1000.0}
+    with (
+        patch("pipecat.serializers.convox.time.monotonic", side_effect=lambda: clock["t"]),
+        patch("pipecat.serializers.convox.logger") as mock_logger,
+    ):
+        # First frame establishes the cadence baseline — no gap yet.
+        await serializer.deserialize(media)
+        # Jump the clock 500ms ahead: well past the 150ms gap threshold.
+        clock["t"] = 1000.5
+        await serializer.deserialize(media)
+
+    warnings = _logged_messages(mock_logger, "warning")
+    assert any("inbound audio GAP" in m for m in warnings)
+    assert serializer._in_gap_count == 1
+    assert serializer._in_gap_max_ms >= 500
+
+
+@pytest.mark.asyncio
+async def test_inbound_no_gap_warning_on_cadence():
+    """Frames arriving on the normal ~20ms cadence must not warn."""
+    serializer = _make_serializer()
+    await _setup(serializer)
+    media = _media_message()
+
+    clock = {"t": 1000.0}
+    with (
+        patch("pipecat.serializers.convox.time.monotonic", side_effect=lambda: clock["t"]),
+        patch("pipecat.serializers.convox.logger") as mock_logger,
+    ):
+        await serializer.deserialize(media)
+        clock["t"] = 1000.02  # 20ms later — normal cadence
+        await serializer.deserialize(media)
+
+    assert not any("inbound audio GAP" in m for m in _logged_messages(mock_logger, "warning"))
+    assert serializer._in_gap_count == 0
