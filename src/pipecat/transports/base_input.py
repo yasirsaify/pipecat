@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     InputImageRawFrame,
+    InterruptionFrame,
     MetricsFrame,
     SpeechControlParamsFrame,
     StartFrame,
@@ -86,9 +87,21 @@ class BaseInputTransport(FrameProcessor):
         # as stuck. See log_review_findings.md, Cases 4 and 5.
         # Hardcoded 0.6s as a sensible default; can be lifted into
         # TransportParams later if a transport needs to override.
+        #
+        # IMPORTANT: only arm this window when the bot stops *naturally* (its
+        # turn ended on its own). On a barge-in the user is already mid-turn
+        # when BotStoppedSpeakingFrame arrives (~600-900ms after they started
+        # talking), so arming the window here would drop ~600ms of *live* user
+        # speech mid-utterance — corrupting the transcript. We detect barge-in
+        # via the InterruptionFrame that broadcast_interruption() pushes
+        # upstream to this head transport, and skip arming in that case.
         self._post_bot_stop_mute_seconds = 0.6
         self._post_bot_stop_mute_until_ts = 0.0
         self._post_bot_stop_mute_dropped = 0
+        # Set when an InterruptionFrame is seen during the current bot turn;
+        # cleared when the bot starts a new turn. Distinguishes a barge-in stop
+        # from a natural turn-end so the mute window isn't armed on barge-in.
+        self._interrupted_since_bot_start = False
 
         # Drop accounting for the other two ways inbound audio can be
         # silently discarded before it reaches the queue (and therefore
@@ -441,12 +454,19 @@ class BaseInputTransport(FrameProcessor):
                 )
             self._post_bot_stop_mute_until_ts = 0.0
             self._post_bot_stop_mute_dropped = 0
+            # New bot turn: forget any interruption seen during the prior turn.
+            self._interrupted_since_bot_start = False
             await self._deprecated_handle_bot_started_speaking(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, BotStoppedSpeakingFrame):
             # Arm post-bot-stop mute window. See push_audio_frame() for
             # the drop logic and __init__ for rationale.
-            if self._post_bot_stop_mute_seconds > 0:
+            #
+            # Skip arming if this stop was caused by a user barge-in: the user
+            # is already mid-utterance, so the window would eat their live
+            # speech. The echo-suppression rationale only applies to a natural
+            # turn-end, where no user turn is in progress.
+            if self._post_bot_stop_mute_seconds > 0 and not self._interrupted_since_bot_start:
                 self._post_bot_stop_mute_until_ts = (
                     time.monotonic() + self._post_bot_stop_mute_seconds
                 )
@@ -463,6 +483,22 @@ class BaseInputTransport(FrameProcessor):
         elif isinstance(frame, EmulateUserStoppedSpeakingFrame):
             logger.debug("Emulating user stopped speaking")
             await self._deprecated_handle_user_interruption(VADState.QUIET, emulated=True)
+        elif isinstance(frame, InterruptionFrame):
+            # A real barge-in: the user is in an active turn. Remember this so
+            # the upcoming BotStoppedSpeakingFrame does NOT arm the mute window,
+            # and disarm any window already armed so we stop dropping live user
+            # speech immediately. (broadcast_interruption() pushes this frame
+            # upstream to this head transport.)
+            self._interrupted_since_bot_start = True
+            if self._post_bot_stop_mute_until_ts:
+                logger.debug(
+                    "BaseInputTransport: post-bot-stop mute window disarmed by "
+                    f"barge-in after dropping {self._post_bot_stop_mute_dropped} "
+                    "inbound frames"
+                )
+            self._post_bot_stop_mute_until_ts = 0.0
+            self._post_bot_stop_mute_dropped = 0
+            await self.push_frame(frame, direction)
         # All other system frames
         elif isinstance(frame, SystemFrame):
             await self.push_frame(frame, direction)
