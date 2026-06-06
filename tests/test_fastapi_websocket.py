@@ -6,10 +6,12 @@
 
 import asyncio
 import unittest
+from unittest import mock
 from unittest.mock import AsyncMock, PropertyMock
 
 from starlette.websockets import WebSocketState
 
+import pipecat.transports.websocket.fastapi as fastapi_module
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketCallbacks,
     FastAPIWebsocketClient,
@@ -249,6 +251,58 @@ class TestWriteFrameListPayload(unittest.IsolatedAsyncioTestCase):
         await out._write_frame(object())
 
         out._client.send.assert_awaited_once_with('{"event": "media"}')
+
+
+class TestDisconnectBoundedClose(unittest.IsolatedAsyncioTestCase):
+    """disconnect() must not block pipeline teardown when a carrier accepts the
+    in-band hangup but never echoes the WS close frame (e.g. ConVox/Deepija).
+
+    A plain ``await websocket.close()`` would hang on the closing handshake;
+    disconnect() bounds it with WS_CLOSE_TIMEOUT_S and proceeds on timeout.
+    """
+
+    def _make_client(self, mock_ws):
+        callbacks = FastAPIWebsocketCallbacks(
+            on_client_connected=AsyncMock(),
+            on_client_disconnected=AsyncMock(),
+            on_session_timeout=AsyncMock(),
+        )
+        return FastAPIWebsocketClient(mock_ws, callbacks)
+
+    async def test_disconnect_returns_when_close_hangs(self):
+        """When close() never completes, disconnect() returns within the bound."""
+        mock_ws = AsyncMock()
+        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+
+        close_started = asyncio.Event()
+
+        async def hanging_close():
+            close_started.set()
+            await asyncio.sleep(60)  # carrier never echoes the close frame
+
+        mock_ws.close = hanging_close
+
+        client = self._make_client(mock_ws)
+
+        with mock.patch.object(fastapi_module, "WS_CLOSE_TIMEOUT_S", 0.05):
+            # Generous outer bound: the real guarantee is "well under 60s".
+            await asyncio.wait_for(client.disconnect(), timeout=2.0)
+
+        self.assertTrue(close_started.is_set())
+        self.assertTrue(client.is_closing)
+
+    async def test_disconnect_completes_on_clean_close(self):
+        """A carrier that echoes the close frame still tears down normally."""
+        mock_ws = AsyncMock()
+        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+        mock_ws.close = AsyncMock()
+
+        client = self._make_client(mock_ws)
+
+        await client.disconnect()
+
+        mock_ws.close.assert_awaited_once()
+        self.assertTrue(client.is_closing)
 
 
 if __name__ == "__main__":
