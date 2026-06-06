@@ -52,18 +52,6 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
-# Upper bound on how long disconnect() waits for the WebSocket closing
-# handshake. Some telephony carriers (e.g. ConVox/Deepija) acknowledge an
-# in-band hangup but never echo the WS close frame, so a plain
-# ``await websocket.close()`` blocks on the handshake until uvicorn's timeout
-# fires (~20s observed). Because EndFrame processing in the output transport
-# awaits stop() before forwarding EndFrame to the pipeline sink, that stall
-# delays on_pipeline_finished, recording upload, and run finalization. Bounding
-# the close lets the pipeline tear down promptly; the endpoint returning will
-# force the socket down regardless of the unfinished handshake.
-WS_CLOSE_TIMEOUT_S = 1.0
-
-
 class FastAPIWebsocketParams(TransportParams):
     """Configuration parameters for FastAPI WebSocket transport.
 
@@ -134,6 +122,8 @@ class FastAPIWebsocketClient:
         self._callbacks = callbacks
         self._leave_counter = 0
         self._transfer_in_progress = False
+        # Detached task for the closing handshake (see disconnect()).
+        self._close_task: Optional[asyncio.Task] = None
         # Diagnostic counters — used to confirm bytes actually leave the
         # WebSocket (vs. only being serialized upstream). See logs in send().
         self._send_count = 0
@@ -217,18 +207,24 @@ class FastAPIWebsocketClient:
 
         if self.is_connected and not self.is_closing:
             self._closing = True
-            try:
-                # Bound the closing handshake: a carrier that never echoes the
-                # close frame must not stall pipeline teardown (see
-                # WS_CLOSE_TIMEOUT_S).
-                await asyncio.wait_for(self._websocket.close(), timeout=WS_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"{self} websocket close handshake did not complete within "
-                    f"{WS_CLOSE_TIMEOUT_S}s; proceeding with teardown"
-                )
-            except Exception as e:
-                logger.error(f"{self} exception while closing the websocket: {e}")
+            # Don't await the closing handshake on the teardown path. Some
+            # carriers (e.g. ConVox/Deepija) accept the in-band hangup but never
+            # echo the WS close frame, so `await websocket.close()` blocks until
+            # uvicorn's handshake timeout fires (~11-20s observed). asyncio.wait_for
+            # can't bound it because Starlette's close() is not cancellable. Since
+            # the output transport awaits stop() (hence disconnect()) before
+            # forwarding EndFrame to the pipeline sink, awaiting here stalls
+            # on_pipeline_finished, recording upload, and run finalization.
+            # Schedule the close and return immediately; the endpoint returning
+            # forces the socket down regardless of the unfinished handshake.
+            self._close_task = asyncio.ensure_future(self._close_websocket())
+
+    async def _close_websocket(self):
+        """Run the WebSocket closing handshake detached from pipeline teardown."""
+        try:
+            await self._websocket.close()
+        except Exception as e:
+            logger.error(f"{self} exception while closing the websocket: {e}")
 
     async def trigger_client_disconnected(self):
         """Trigger the client disconnected callback."""
