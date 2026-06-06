@@ -262,6 +262,21 @@ class SmallWebRTCClient:
         # Audio resampler - will be configured during setup with target sample rate
         self._audio_in_resampler = None
 
+        # Inbound media-timeline gap accounting. aiortc advances an audio
+        # frame's pts by one frame's worth of samples per received frame; a
+        # larger jump means RTP packets were lost on the inbound stream (audio
+        # never arrived over the network). This is the WebRTC analogue of the
+        # ConVox serializer's inbound-gap log and the prime suspect for user
+        # speech missing from the transcript/recording. The authoritative loss
+        # number is the periodic RTP getStats() log in SmallWebRTCInputTransport;
+        # this per-frame log pinpoints *when* the loss happened.
+        self._in_audio_received = 0
+        self._last_audio_pts: Optional[int] = None
+        self._last_audio_samples = 0
+        self._in_audio_gap_count = 0
+        self._in_audio_gap_ms_max = 0.0
+        self._in_audio_gap_ms_total = 0.0
+
         @self._webrtc_connection.event_handler("connected")
         async def on_connected(connection: SmallWebRTCConnection):
             logger.debug("Peer connection established.")
@@ -399,6 +414,35 @@ class SmallWebRTCClient:
                 # If we don't read any audio let's sleep for a little bit (i.e. busy wait).
                 await asyncio.sleep(0.01)
                 continue
+
+            # Inbound media-timeline gap detection (see __init__ for rationale).
+            # A WARNING here that lines up with a missing-audio timestamp means
+            # inbound RTP was lost — i.e. the loss is upstream of us (the peer's
+            # network / TURN), not a pipeline or deployment regression.
+            pts = getattr(frame, "pts", None)
+            rate = getattr(frame, "sample_rate", 0) or 0
+            samples = getattr(frame, "samples", 0) or 0
+            if pts is not None and rate:
+                if self._last_audio_pts is not None:
+                    gap_samples = pts - (self._last_audio_pts + self._last_audio_samples)
+                    # Warn on a jump > ~60ms (≈3 frames), above normal jitter.
+                    if gap_samples > int(rate * 0.06):
+                        gap_ms = gap_samples / rate * 1000.0
+                        self._in_audio_gap_count += 1
+                        self._in_audio_gap_ms_total += gap_ms
+                        if gap_ms > self._in_audio_gap_ms_max:
+                            self._in_audio_gap_ms_max = gap_ms
+                        logger.warning(
+                            f"SmallWebRTC: inbound audio GAP of {gap_ms:.0f}ms "
+                            f"(lost RTP) before frame #{self._in_audio_received + 1} — "
+                            f"gap_count={self._in_audio_gap_count}, "
+                            f"max_gap_ms={self._in_audio_gap_ms_max:.0f}, "
+                            f"total_lost_ms={self._in_audio_gap_ms_total:.0f}, "
+                            f"wallclock_ms={int(time.time() * 1000)}"
+                        )
+                self._last_audio_pts = pts
+                self._last_audio_samples = samples
+            self._in_audio_received += 1
 
             # Resample if needed, otherwise use the frame as-is
             frames_to_process = (
@@ -601,6 +645,7 @@ class SmallWebRTCInputTransport(BaseInputTransport):
         self._receive_audio_task = None
         self._receive_video_task = None
         self._receive_screen_video_task = None
+        self._rtp_stats_task = None
         self._image_requests: List[UserImageRequestFrame] = []
 
         # Whether we have seen a StartFrame already.
@@ -636,6 +681,8 @@ class SmallWebRTCInputTransport(BaseInputTransport):
         await self.set_transport_ready(frame)
         if not self._receive_audio_task and self._params.audio_in_enabled:
             self._receive_audio_task = self.create_task(self._receive_audio())
+            if not self._rtp_stats_task:
+                self._rtp_stats_task = self.create_task(self._log_rtp_stats())
         if not self._receive_video_task and self._params.video_in_enabled:
             self._receive_video_task = self.create_task(self._receive_video(CAM_VIDEO_SOURCE))
 
@@ -644,9 +691,73 @@ class SmallWebRTCInputTransport(BaseInputTransport):
         if self._receive_audio_task:
             await self.cancel_task(self._receive_audio_task)
             self._receive_audio_task = None
+        if self._rtp_stats_task:
+            await self.cancel_task(self._rtp_stats_task)
+            self._rtp_stats_task = None
         if self._receive_video_task:
             await self.cancel_task(self._receive_video_task)
             self._receive_video_task = None
+
+    async def _log_rtp_stats(self):
+        """Periodically log inbound RTP audio stats (packets received/lost, jitter).
+
+        This is the authoritative packet-loss signal for diagnosing dropped
+        user audio on WebRTC calls. Loss reported here means audio never
+        arrived over the network (e.g. a weak peer uplink or TURN-relay loss),
+        as opposed to anything the pipeline or deployment did — the WebRTC
+        counterpart to the ConVox serializer's inbound-gap accounting. Pairs
+        with the per-frame pts-gap WARNING in SmallWebRTCClient.read_audio_frame
+        (which pinpoints *when* loss happened); this gives the totals.
+        """
+        interval = 5.0
+        last_received = 0
+        last_lost = 0
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                pc = getattr(self._client._webrtc_connection, "pc", None)
+                if pc is None:
+                    continue
+                try:
+                    report = await pc.getStats()
+                except Exception as e:
+                    logger.debug(
+                        f"SmallWebRTC: getStats failed: {e.__class__.__name__} ({e})"
+                    )
+                    continue
+                for stat in report.values():
+                    if getattr(stat, "type", None) != "inbound-rtp":
+                        continue
+                    if getattr(stat, "kind", getattr(stat, "mediaType", None)) != "audio":
+                        continue
+                    received = getattr(stat, "packetsReceived", 0) or 0
+                    lost = getattr(stat, "packetsLost", 0) or 0
+                    jitter = getattr(stat, "jitter", 0.0) or 0.0
+                    d_received = received - last_received
+                    d_lost = lost - last_lost
+                    total = received + lost
+                    window_total = d_received + d_lost
+                    loss_pct = (lost / total * 100.0) if total else 0.0
+                    window_loss_pct = (
+                        (d_lost / window_total * 100.0) if window_total else 0.0
+                    )
+                    log = logger.warning if (d_lost > 0) else logger.info
+                    log(
+                        f"SmallWebRTC inbound RTP audio: received={received} "
+                        f"lost={lost} ({loss_pct:.1f}% cumulative) | last "
+                        f"{interval:.0f}s +{d_received} recv / +{d_lost} lost "
+                        f"({window_loss_pct:.1f}%), jitter={jitter}"
+                    )
+                    last_received = received
+                    last_lost = lost
+        except asyncio.CancelledError:
+            total = last_received + last_lost
+            logger.info(
+                f"SmallWebRTC inbound RTP audio FINAL: received={last_received} "
+                f"lost={last_lost} "
+                f"({(last_lost / total * 100.0) if total else 0.0:.1f}% loss)"
+            )
+            raise
 
     async def stop(self, frame: EndFrame):
         """Stop the input transport and disconnect from WebRTC.
