@@ -6,11 +6,10 @@
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock
 
 from starlette.websockets import WebSocketState
 
-import pipecat.transports.websocket.fastapi as fastapi_module
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketCallbacks,
     FastAPIWebsocketClient,
@@ -253,13 +252,12 @@ class TestWriteFrameListPayload(unittest.IsolatedAsyncioTestCase):
 
 
 class TestDisconnectFireAndForgetClose(unittest.IsolatedAsyncioTestCase):
-    """disconnect() schedules a detached close and never blocks teardown.
+    """disconnect() schedules the WS close as a detached task and never blocks.
 
     Some carriers (e.g. ConVox/Deepija) accept the in-band hangup but never echo
     the WS close frame, so `await websocket.close()` lingers ~11-20s on the
-    handshake. _close_websocket attempts a graceful close, then force-aborts the
-    underlying transport (TCP RST) after WS_FORCE_CLOSE_GRACE_S so the socket
-    doesn't hang.
+    handshake. Awaiting it on the teardown path would stall on_pipeline_finished /
+    recording upload, so disconnect() fires it and returns immediately.
     """
 
     def _make_client(self, mock_ws):
@@ -270,107 +268,47 @@ class TestDisconnectFireAndForgetClose(unittest.IsolatedAsyncioTestCase):
         )
         return FastAPIWebsocketClient(mock_ws, callbacks)
 
-    def _attach_fake_transport(self, mock_ws):
-        """Wire mock_ws._send.__self__.transport so _abort_transport can reach it.
-
-        Mirrors uvicorn: the ASGI send is a bound method of the protocol, whose
-        instance holds the asyncio transport.
-        """
-
-        class _FakeProtocol:
-            def __init__(self):
-                self.transport = MagicMock()
-
-            async def asgi_send(self, message):
-                pass
-
-        proto = _FakeProtocol()
-        mock_ws._send = proto.asgi_send  # bound method → __self__ is proto
-        return proto.transport
-
-    async def test_disconnect_returns_immediately(self):
-        """disconnect() returns promptly and schedules the detached close."""
-        mock_ws = AsyncMock()
-        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
-        mock_ws.close = AsyncMock()
-        self._attach_fake_transport(mock_ws)
-
-        client = self._make_client(mock_ws)
-
-        await asyncio.wait_for(client.disconnect(), timeout=1.0)
-        self.assertTrue(client.is_closing)
-        await asyncio.wait_for(client._close_task, timeout=1.0)
-
-    async def test_force_aborts_when_handshake_stalls(self):
-        """When close() never completes, the transport is aborted after the grace."""
+    async def test_disconnect_returns_without_awaiting_close(self):
+        """disconnect() returns immediately even while close() is still blocked."""
         mock_ws = AsyncMock()
         type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
 
+        close_started = asyncio.Event()
         close_may_finish = asyncio.Event()
 
         async def hanging_close():
+            close_started.set()
             await close_may_finish.wait()  # carrier never echoes the close frame
 
         mock_ws.close = hanging_close
-        transport = self._attach_fake_transport(mock_ws)
-        # Aborting the transport unblocks the stuck graceful close (socket dies).
-        transport.abort.side_effect = lambda: close_may_finish.set()
 
         client = self._make_client(mock_ws)
-        with patch.object(fastapi_module, "WS_FORCE_CLOSE_GRACE_S", 0.05):
-            await client.disconnect()
-            await asyncio.wait_for(client._close_task, timeout=1.0)
 
-        transport.abort.assert_called_once()
+        # Returns promptly despite close() being stuck (not awaited by disconnect).
+        await asyncio.wait_for(client.disconnect(), timeout=1.0)
+        self.assertTrue(client.is_closing)
 
-    async def test_force_abort_resolves_through_wrapped_send(self):
-        """The transport is reachable even when send is wrapped (Starlette/FastAPI).
+        # The close was scheduled and is in flight, detached from disconnect().
+        await asyncio.sleep(0)
+        self.assertTrue(close_started.is_set())
+        self.assertFalse(client._close_task.done())
 
-        FastAPI always wraps the websocket send in exception-handling closures, so
-        send.__self__ is not the protocol; the resolver must unwrap the closures.
-        """
-        mock_ws = AsyncMock()
-        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+        # Let the detached task finish so the test doesn't leak it.
+        close_may_finish.set()
+        await client._close_task
 
-        close_may_finish = asyncio.Event()
-
-        async def hanging_close():
-            await close_may_finish.wait()
-
-        mock_ws.close = hanging_close
-        transport = self._attach_fake_transport(mock_ws)
-        transport.abort.side_effect = lambda: close_may_finish.set()
-
-        # Wrap the bound asgi_send in nested closures, mimicking Starlette's
-        # exception-handling `sender` wrappers.
-        def wrap(inner):
-            async def sender(message):
-                await inner(message)
-
-            return sender
-
-        mock_ws._send = wrap(wrap(mock_ws._send))
-
-        client = self._make_client(mock_ws)
-        with patch.object(fastapi_module, "WS_FORCE_CLOSE_GRACE_S", 0.05):
-            await client.disconnect()
-            await asyncio.wait_for(client._close_task, timeout=1.0)
-
-        transport.abort.assert_called_once()
-
-    async def test_no_abort_on_clean_close(self):
-        """A carrier that echoes the close frame is never force-aborted."""
+    async def test_disconnect_schedules_clean_close(self):
+        """A carrier that echoes the close frame still gets a close() call."""
         mock_ws = AsyncMock()
         type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
         mock_ws.close = AsyncMock()
-        transport = self._attach_fake_transport(mock_ws)
 
         client = self._make_client(mock_ws)
-        with patch.object(fastapi_module, "WS_FORCE_CLOSE_GRACE_S", 0.5):
-            await client.disconnect()
-            await asyncio.wait_for(client._close_task, timeout=1.0)
 
-        transport.abort.assert_not_called()
+        await client.disconnect()
+        self.assertTrue(client.is_closing)
+
+        await client._close_task
         mock_ws.close.assert_awaited_once()
 
 
