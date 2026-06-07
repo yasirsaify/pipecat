@@ -52,6 +52,13 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+# Grace period for the graceful WS closing handshake before we force the socket
+# down. Some telephony carriers (e.g. ConVox/Deepija) never echo the close
+# frame, so `websocket.close()` lingers ~11-20s on the handshake. After this
+# grace we abort the underlying transport (TCP RST) so the socket doesn't hang.
+WS_FORCE_CLOSE_GRACE_S = 1.0
+
+
 class FastAPIWebsocketParams(TransportParams):
     """Configuration parameters for FastAPI WebSocket transport.
 
@@ -220,11 +227,56 @@ class FastAPIWebsocketClient:
             self._close_task = asyncio.ensure_future(self._close_websocket())
 
     async def _close_websocket(self):
-        """Run the WebSocket closing handshake detached from pipeline teardown."""
+        """Close the WebSocket, forcing the socket down if the peer stalls the handshake.
+
+        Runs detached from pipeline teardown. We first attempt a graceful close;
+        if the carrier hasn't completed the closing handshake within
+        WS_FORCE_CLOSE_GRACE_S, we abort the underlying transport (TCP RST) so a
+        carrier that never echoes the close frame can't leave the socket lingering
+        ~11-20s.
+        """
+        graceful = asyncio.ensure_future(self._graceful_close())
+        _, pending = await asyncio.wait({graceful}, timeout=WS_FORCE_CLOSE_GRACE_S)
+        if pending:
+            self._abort_transport()
+            # The transport is gone now; let the graceful close unwind.
+            try:
+                await graceful
+            except Exception:
+                pass
+
+    async def _graceful_close(self):
+        """Perform the cooperative WebSocket closing handshake."""
         try:
             await self._websocket.close()
         except Exception as e:
             logger.error(f"{self} exception while closing the websocket: {e}")
+
+    def _abort_transport(self):
+        """Force the underlying socket closed (TCP RST), bypassing the WS handshake.
+
+        ASGI exposes no abort, so reach the uvicorn transport via the bound
+        asgi_send method. Best-effort: if the send isn't a bound protocol method
+        (e.g. wrapped by ASGI middleware), we leave the graceful close to time out
+        as before rather than risk an error.
+        """
+        try:
+            send = getattr(self._websocket, "_send", None)
+            protocol = getattr(send, "__self__", None)
+            transport = getattr(protocol, "transport", None)
+            if transport is not None:
+                transport.abort()
+                logger.info(
+                    f"{self} forced WS transport abort after "
+                    f"{WS_FORCE_CLOSE_GRACE_S}s close-handshake grace"
+                )
+            else:
+                logger.warning(
+                    f"{self} could not reach transport to force-abort WS; "
+                    f"leaving graceful close to time out"
+                )
+        except Exception as e:
+            logger.warning(f"{self} error while force-aborting WS transport: {e}")
 
     async def trigger_client_disconnected(self):
         """Trigger the client disconnected callback."""
