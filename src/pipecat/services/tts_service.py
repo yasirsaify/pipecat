@@ -296,6 +296,15 @@ class TTSService(AIService):
         self._push_stop_frames: bool = push_stop_frames
         self._push_start_frame: bool = push_start_frame
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
+        # End-of-call (EndFrame) finalization: once we are tearing down AND the
+        # context has already produced audio, finalize the context after this
+        # much idle instead of the full stop_frame_timeout_s. The full timeout is
+        # a TTFB guard for the *first* audio chunk (raised to survive Sarvam TTFB
+        # spikes — see service_factory); it is unnecessary once audio has flowed
+        # and the call is ending, where it just delays the EndFrame -> telephony
+        # stop -> caller hangup.
+        self._tearing_down: bool = False
+        self._teardown_stop_frame_timeout_s: float = 1.0
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
@@ -758,6 +767,10 @@ class TTSService(AIService):
                     # directly would let it race ahead of queued text frames.
                     await self._serialization_queue.put(frame)
             else:
+                # EndFrame: the call is ending. Switch the active context to the
+                # short teardown finalization so the EndFrame (and the telephony
+                # stop event) isn't held by the full stop_frame_timeout_s idle.
+                await self._begin_teardown_finalization()
                 await self.push_frame(frame, direction)
 
             await self.on_turn_context_completed()
@@ -1359,6 +1372,37 @@ class TTSService(AIService):
             frame.pts = self._word_last_pts
             await self.push_frame(frame)
 
+    def _audio_context_timeout(self, audio_received: bool) -> float:
+        """Idle timeout for finalizing an audio context.
+
+        The full ``stop_frame_timeout_s`` guards the wait for the *first* audio
+        chunk (TTFB) — it is intentionally large to survive provider TTFB spikes
+        (lowering it caused silent greetings). Once audio has been received AND
+        the call is tearing down (an EndFrame was processed), use the much
+        shorter teardown timeout so the EndFrame / telephony stop isn't delayed.
+
+        Args:
+            audio_received: Whether the context has produced at least one audio
+                frame.
+        """
+        if self._tearing_down and audio_received:
+            return min(self._stop_frame_timeout_s, self._teardown_stop_frame_timeout_s)
+        return self._stop_frame_timeout_s
+
+    async def _begin_teardown_finalization(self):
+        """Switch active audio contexts to fast finalization at end of call.
+
+        Called when an EndFrame is processed. Sets the teardown flag (so
+        _handle_audio_context uses the short idle timeout once audio has flowed)
+        and nudges the active context's queue so any in-flight long idle wait
+        re-evaluates the timeout immediately. The pre-first-audio TTFB guard is
+        untouched (the short timeout only applies after audio_frames > 0).
+        """
+        self._tearing_down = True
+        context_id = self._playing_context_id
+        if context_id and self.audio_context_available(context_id):
+            await self._audio_contexts[context_id].put(TTSService._CONTEXT_KEEPALIVE)
+
     async def _handle_audio_context(self, context_id: str):
         """Process items from an audio context queue until it is exhausted."""
         queue = self._audio_contexts[context_id]
@@ -1373,7 +1417,13 @@ class TTSService(AIService):
         keepalives = 0
         while running:
             try:
-                frame = await asyncio.wait_for(queue.get(), timeout=self._stop_frame_timeout_s)
+                # Full timeout guards the *first* audio chunk (TTFB). Once audio
+                # has flowed and we're tearing down (EndFrame), finalize quickly
+                # so the EndFrame -> telephony stop -> caller hangup isn't delayed.
+                frame = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=self._audio_context_timeout(audio_received=audio_frames > 0),
+                )
                 if frame is TTSService._CONTEXT_KEEPALIVE:
                     # Context is still in use, reset the timeout.
                     keepalives += 1
@@ -1420,9 +1470,11 @@ class TTSService(AIService):
                 # We didn't get audio, so let's consider this context finished.
                 logger.trace(f"{self} time out on audio context {context_id}")
                 since = (time.monotonic() - last_audio_ts) * 1000.0 if last_audio_ts else -1.0
+                effective_timeout = self._audio_context_timeout(audio_received=audio_frames > 0)
                 logger.info(
                     f"{self} teardown: audio context {context_id} finalized via "
-                    f"IDLE TIMEOUT ({self._stop_frame_timeout_s}s) — {since:.0f}ms since last audio, "
+                    f"IDLE TIMEOUT ({effective_timeout}s, tearing_down={self._tearing_down}) — "
+                    f"{since:.0f}ms since last audio, "
                     f"audio_frames={audio_frames}, keepalives={keepalives}"
                 )
                 if should_push_stop_frame and self._push_stop_frames:
