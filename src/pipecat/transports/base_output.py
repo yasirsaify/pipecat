@@ -428,6 +428,11 @@ class BaseOutputTransport(FrameProcessor):
             # Last time the bot actually spoke.
             self._bot_speech_last_time = 0
 
+            # Teardown diagnostics: timestamps to attribute end-of-call latency
+            # (last spoken word -> EndFrame dequeued -> end-silence -> stop).
+            self._bot_stopped_ts = 0.0
+            self._endframe_enqueued_ts = 0.0
+
             self._audio_task: Optional[asyncio.Task] = None
             self._video_task: Optional[asyncio.Task] = None
             self._clock_task: Optional[asyncio.Task] = None
@@ -484,6 +489,19 @@ class BaseOutputTransport(FrameProcessor):
             # Let the sink tasks process the queue until they reach this EndFrame.
             await self._clock_queue.put((float("inf"), frame.id, frame))
             await self._audio_queue.put(frame)
+
+            # Teardown diagnostic: how much audio is queued ahead of the EndFrame
+            # (real TTS trailing audio still to be clocked out at the output).
+            self._endframe_enqueued_ts = time.time()
+            since_botstop = (
+                (self._endframe_enqueued_ts - self._bot_stopped_ts) * 1000.0
+                if self._bot_stopped_ts
+                else -1.0
+            )
+            logger.info(
+                f"{self} teardown: EndFrame enqueued — audio_qsize={self._audio_queue.qsize()}, "
+                f"{since_botstop:.0f}ms after bot stopped speaking"
+            )
 
             # At this point we have enqueued an EndFrame and we need to wait for
             # that EndFrame to be processed by the audio and clock tasks. We
@@ -652,6 +670,9 @@ class BaseOutputTransport(FrameProcessor):
 
             self._bot_speaking = False
             self._tts_audio_received = False
+            # Teardown diagnostic: mark when the last spoken word finished so we
+            # can attribute the gap until the EndFrame / stop.
+            self._bot_stopped_ts = time.time()
 
             # Clean audio buffer (there could be tiny left overs if not multiple
             # to our output chunk size).
@@ -801,6 +822,24 @@ class BaseOutputTransport(FrameProcessor):
             async for frame in self._next_frame():
                 # No need to push EndFrame, it's pushed from process_frame().
                 if isinstance(frame, EndFrame):
+                    # Teardown diagnostic: time from last spoken word and from
+                    # EndFrame enqueue to it being clocked out — distinguishes
+                    # real queued audio (drain) from EndFrame-arrival lag.
+                    now = time.time()
+                    since_botstop = (
+                        (now - self._bot_stopped_ts) * 1000.0 if self._bot_stopped_ts else -1.0
+                    )
+                    drain_ms = (
+                        (now - self._endframe_enqueued_ts) * 1000.0
+                        if self._endframe_enqueued_ts
+                        else -1.0
+                    )
+                    logger.info(
+                        f"{self} teardown: EndFrame reached audio task — "
+                        f"{since_botstop:.0f}ms after bot stopped, "
+                        f"{drain_ms:.0f}ms to drain queued audio after enqueue; "
+                        f"now sending {self._params.audio_out_end_silence_secs}s end-silence"
+                    )
                     # Send some final silence so words don't cut out.
                     await self._send_silence(self._params.audio_out_end_silence_secs)
                     break
