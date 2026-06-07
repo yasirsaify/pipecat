@@ -7,6 +7,7 @@
 """Base classes for Text-to-speech services."""
 
 import asyncio
+import time
 import uuid
 import warnings
 from abc import abstractmethod
@@ -1364,14 +1365,28 @@ class TTSService(AIService):
         running = True
         timestamps_started = False
         should_push_stop_frame = False
+        # Teardown diagnostics: attribute how long after the last audio chunk the
+        # context is finalized (TTSStoppedFrame), and via which path (idle timeout
+        # vs explicit end), since the EndFrame/stop is ordered behind it.
+        last_audio_ts = 0.0
+        audio_frames = 0
+        keepalives = 0
         while running:
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=self._stop_frame_timeout_s)
                 if frame is TTSService._CONTEXT_KEEPALIVE:
                     # Context is still in use, reset the timeout.
+                    keepalives += 1
                     continue
                 elif frame is None:
                     running = False
+                    since = (time.monotonic() - last_audio_ts) * 1000.0 if last_audio_ts else -1.0
+                    logger.info(
+                        f"{self} teardown: audio context {context_id} finalized via "
+                        f"CONTEXT END (None) — {since:.0f}ms since last audio, "
+                        f"audio_frames={audio_frames}, keepalives={keepalives}, "
+                        f"stop_frame_timeout_s={self._stop_frame_timeout_s}"
+                    )
                 elif isinstance(frame, _WordTimestampEntry):
                     # Route word timestamps through _add_word_timestamps so they are
                     # processed in playback order alongside audio frames.
@@ -1380,6 +1395,8 @@ class TTSService(AIService):
                     )
                     continue
                 elif isinstance(frame, TTSAudioRawFrame):
+                    last_audio_ts = time.monotonic()
+                    audio_frames += 1
                     # Set the word-timestamp baseline once, on the first audio chunk.
                     if not timestamps_started:
                         await self.stop_ttfb_metrics()
@@ -1402,6 +1419,12 @@ class TTSService(AIService):
             except asyncio.TimeoutError:
                 # We didn't get audio, so let's consider this context finished.
                 logger.trace(f"{self} time out on audio context {context_id}")
+                since = (time.monotonic() - last_audio_ts) * 1000.0 if last_audio_ts else -1.0
+                logger.info(
+                    f"{self} teardown: audio context {context_id} finalized via "
+                    f"IDLE TIMEOUT ({self._stop_frame_timeout_s}s) — {since:.0f}ms since last audio, "
+                    f"audio_frames={audio_frames}, keepalives={keepalives}"
+                )
                 if should_push_stop_frame and self._push_stop_frames:
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     should_push_stop_frame = False
