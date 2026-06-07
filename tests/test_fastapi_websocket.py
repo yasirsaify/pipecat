@@ -323,6 +323,41 @@ class TestDisconnectFireAndForgetClose(unittest.IsolatedAsyncioTestCase):
 
         transport.abort.assert_called_once()
 
+    async def test_force_abort_resolves_through_wrapped_send(self):
+        """The transport is reachable even when send is wrapped (Starlette/FastAPI).
+
+        FastAPI always wraps the websocket send in exception-handling closures, so
+        send.__self__ is not the protocol; the resolver must unwrap the closures.
+        """
+        mock_ws = AsyncMock()
+        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+
+        close_may_finish = asyncio.Event()
+
+        async def hanging_close():
+            await close_may_finish.wait()
+
+        mock_ws.close = hanging_close
+        transport = self._attach_fake_transport(mock_ws)
+        transport.abort.side_effect = lambda: close_may_finish.set()
+
+        # Wrap the bound asgi_send in nested closures, mimicking Starlette's
+        # exception-handling `sender` wrappers.
+        def wrap(inner):
+            async def sender(message):
+                await inner(message)
+
+            return sender
+
+        mock_ws._send = wrap(wrap(mock_ws._send))
+
+        client = self._make_client(mock_ws)
+        with patch.object(fastapi_module, "WS_FORCE_CLOSE_GRACE_S", 0.05):
+            await client.disconnect()
+            await asyncio.wait_for(client._close_task, timeout=1.0)
+
+        transport.abort.assert_called_once()
+
     async def test_no_abort_on_clean_close(self):
         """A carrier that echoes the close frame is never force-aborted."""
         mock_ws = AsyncMock()

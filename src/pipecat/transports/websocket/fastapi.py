@@ -255,15 +255,15 @@ class FastAPIWebsocketClient:
     def _abort_transport(self):
         """Force the underlying socket closed (TCP RST), bypassing the WS handshake.
 
-        ASGI exposes no abort, so reach the uvicorn transport via the bound
-        asgi_send method. Best-effort: if the send isn't a bound protocol method
-        (e.g. wrapped by ASGI middleware), we leave the graceful close to time out
-        as before rather than risk an error.
+        ASGI exposes no abort, so reach the uvicorn transport. The ASGI ``send``
+        callable is the uvicorn protocol's bound ``asgi_send`` (its ``__self__``
+        holds ``transport``), but Starlette/FastAPI wrap it in exception-handling
+        closures, so we unwrap the closure chain to find it. Best-effort: if the
+        transport can't be resolved we leave the graceful close to time out as
+        before rather than risk an error.
         """
         try:
-            send = getattr(self._websocket, "_send", None)
-            protocol = getattr(send, "__self__", None)
-            transport = getattr(protocol, "transport", None)
+            transport = self._resolve_asgi_transport(getattr(self._websocket, "_send", None))
             if transport is not None:
                 transport.abort()
                 logger.info(
@@ -277,6 +277,37 @@ class FastAPIWebsocketClient:
                 )
         except Exception as e:
             logger.warning(f"{self} error while force-aborting WS transport: {e}")
+
+    @classmethod
+    def _resolve_asgi_transport(cls, send, _depth: int = 0):
+        """Find the asyncio transport behind an ASGI ``send`` callable.
+
+        uvicorn's ``send`` is a bound method whose ``__self__`` is the protocol
+        holding ``.transport``. Starlette/FastAPI wrap ``send`` in nested
+        ``sender`` closures (exception handling), so we recurse through closure
+        cells until we find a bound method exposing a transport. Depth-bounded.
+        """
+        if send is None or _depth > 8:
+            return None
+
+        transport = getattr(getattr(send, "__self__", None), "transport", None)
+        if transport is not None:
+            return transport
+
+        for cell in getattr(send, "__closure__", None) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if callable(value):
+                transport = cls._resolve_asgi_transport(value, _depth + 1)
+                if transport is not None:
+                    return transport
+            else:
+                transport = getattr(getattr(value, "__self__", None), "transport", None)
+                if transport is not None:
+                    return transport
+        return None
 
     async def trigger_client_disconnected(self):
         """Trigger the client disconnected callback."""
