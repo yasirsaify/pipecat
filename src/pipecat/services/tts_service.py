@@ -158,7 +158,14 @@ class TTSService(AIService):
         # if True, TTSService will push TTSStartedFrames and create audio contexts automatically
         push_start_frame: bool = False,
         # if push_stop_frames is True, wait for this idle period before pushing TTSStoppedFrame
+        # while waiting for the FIRST audio chunk of a context (TTFB guard).
         stop_frame_timeout_s: float = 3.0,
+        # idle period before pushing TTSStoppedFrame AFTER audio has been received
+        # (end-of-turn detection). Kept short so the EndFrame / telephony stop
+        # isn't delayed at end of call; the larger stop_frame_timeout_s only
+        # guards the wait for the first chunk. None (default) → single-tier
+        # behavior (use stop_frame_timeout_s in both phases); opt in per service.
+        audio_done_timeout_s: Optional[float] = None,
         # if True, TTSService will push silence audio frames after TTSStoppedFrame
         push_silence_after_stop: bool = False,
         # if push_silence_after_stop is True, send this amount of audio silence
@@ -296,15 +303,12 @@ class TTSService(AIService):
         self._push_stop_frames: bool = push_stop_frames
         self._push_start_frame: bool = push_start_frame
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
-        # End-of-call (EndFrame) finalization: once we are tearing down AND the
-        # context has already produced audio, finalize the context after this
-        # much idle instead of the full stop_frame_timeout_s. The full timeout is
-        # a TTFB guard for the *first* audio chunk (raised to survive Sarvam TTFB
-        # spikes — see service_factory); it is unnecessary once audio has flowed
-        # and the call is ending, where it just delays the EndFrame -> telephony
-        # stop -> caller hangup.
-        self._tearing_down: bool = False
-        self._teardown_stop_frame_timeout_s: float = 1.0
+        # Idle period for finalizing a context once it has produced audio
+        # (end-of-turn detection). The larger stop_frame_timeout_s is a TTFB
+        # guard for the *first* chunk only; keeping the post-audio timeout short
+        # avoids delaying the EndFrame -> telephony stop -> caller hangup at end
+        # of call. None disables the two-tier behavior (use the full timeout).
+        self._audio_done_timeout_s: Optional[float] = audio_done_timeout_s
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
@@ -767,10 +771,6 @@ class TTSService(AIService):
                     # directly would let it race ahead of queued text frames.
                     await self._serialization_queue.put(frame)
             else:
-                # EndFrame: the call is ending. Switch the active context to the
-                # short teardown finalization so the EndFrame (and the telephony
-                # stop event) isn't held by the full stop_frame_timeout_s idle.
-                await self._begin_teardown_finalization()
                 await self.push_frame(frame, direction)
 
             await self.on_turn_context_completed()
@@ -1375,33 +1375,23 @@ class TTSService(AIService):
     def _audio_context_timeout(self, audio_received: bool) -> float:
         """Idle timeout for finalizing an audio context.
 
-        The full ``stop_frame_timeout_s`` guards the wait for the *first* audio
-        chunk (TTFB) — it is intentionally large to survive provider TTFB spikes
-        (lowering it caused silent greetings). Once audio has been received AND
-        the call is tearing down (an EndFrame was processed), use the much
-        shorter teardown timeout so the EndFrame / telephony stop isn't delayed.
+        Two-tier:
+        - Before the first audio chunk, use the full ``stop_frame_timeout_s``.
+          This is the TTFB guard — intentionally large to survive provider TTFB
+          spikes; lowering it caused silent greetings.
+        - Once audio has been received, use the shorter ``audio_done_timeout_s``
+          (end-of-turn detection). This stops the full timeout from delaying the
+          EndFrame -> telephony stop -> caller hangup at end of call, without
+          weakening the TTFB guard. ``audio_done_timeout_s=None`` disables the
+          second tier (original single-tier behavior).
 
         Args:
             audio_received: Whether the context has produced at least one audio
                 frame.
         """
-        if self._tearing_down and audio_received:
-            return min(self._stop_frame_timeout_s, self._teardown_stop_frame_timeout_s)
+        if audio_received and self._audio_done_timeout_s is not None:
+            return min(self._stop_frame_timeout_s, self._audio_done_timeout_s)
         return self._stop_frame_timeout_s
-
-    async def _begin_teardown_finalization(self):
-        """Switch active audio contexts to fast finalization at end of call.
-
-        Called when an EndFrame is processed. Sets the teardown flag (so
-        _handle_audio_context uses the short idle timeout once audio has flowed)
-        and nudges the active context's queue so any in-flight long idle wait
-        re-evaluates the timeout immediately. The pre-first-audio TTFB guard is
-        untouched (the short timeout only applies after audio_frames > 0).
-        """
-        self._tearing_down = True
-        context_id = self._playing_context_id
-        if context_id and self.audio_context_available(context_id):
-            await self._audio_contexts[context_id].put(TTSService._CONTEXT_KEEPALIVE)
 
     async def _handle_audio_context(self, context_id: str):
         """Process items from an audio context queue until it is exhausted."""
@@ -1473,7 +1463,7 @@ class TTSService(AIService):
                 effective_timeout = self._audio_context_timeout(audio_received=audio_frames > 0)
                 logger.info(
                     f"{self} teardown: audio context {context_id} finalized via "
-                    f"IDLE TIMEOUT ({effective_timeout}s, tearing_down={self._tearing_down}) — "
+                    f"IDLE TIMEOUT ({effective_timeout}s, audio_received={audio_frames > 0}) — "
                     f"{since:.0f}ms since last audio, "
                     f"audio_frames={audio_frames}, keepalives={keepalives}"
                 )
