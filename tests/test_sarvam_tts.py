@@ -25,15 +25,20 @@ async def _drain(agen):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ['"', "   ", '"  "', "।", "...", "—"])
+@pytest.mark.parametrize(
+    "text",
+    ['"', "   ", '"  "', "।", "...", "—", "15", "1.", "2)", "5+1"],
+)
 async def test_run_tts_skips_unsynthesizable_text(monkeypatch, text):
-    """Punctuation/whitespace-only chunks must not be sent to Sarvam.
+    """Chunks with no letter from a supported language must not be sent to Sarvam.
 
     Sarvam returns "400: Text must contain at least one character from the
     allowed languages." for such fragments and tears down the websocket, so
     run_tts should skip them entirely. Sentence aggregation can isolate a
-    trailing closing quote as its own chunk, which previously broke the
-    end-of-call goodbye line.
+    trailing closing quote or an enumeration/quantity marker as its own chunk
+    — e.g. a bare list number "1." (run 283, gpt-5-mini brand-list output) —
+    which is digits-only and would still fail Sarvam's language check even
+    though it is alphanumeric.
     """
     service = _make_service()
 
@@ -57,8 +62,22 @@ async def test_run_tts_skips_unsynthesizable_text(monkeypatch, text):
 
 
 @pytest.mark.asyncio
-async def test_run_tts_sends_synthesizable_text(monkeypatch):
-    """Text with at least one alphanumeric character is sent for synthesis."""
+@pytest.mark.parametrize(
+    "text",
+    [
+        "धन्यवाद, आपका दिन शुभ हो।",
+        # Domain-critical: numbers, sizes, prices and offer ratios carry a
+        # letter (unit/word/script), so the letter guard must never drop them.
+        "200 ML × 5",
+        "Keston Hair Oil",
+        "250 एमएल",  # digits + Devanagari
+        "₹250 का",  # currency + Devanagari (no ASCII letter)
+        "5+1 scheme चल रही।",  # offer ratio embedded in a sentence
+    ],
+)
+async def test_run_tts_sends_synthesizable_text(monkeypatch, text):
+    """Any chunk with at least one letter is sent — including mixed digit+letter
+    text like "200 ML × 5", which must not be over-skipped by the letter guard."""
     service = _make_service()
 
     sent = []
@@ -76,9 +95,9 @@ async def test_run_tts_sends_synthesizable_text(monkeypatch):
     monkeypatch.setattr(service, "_connect", fake_connect)
     monkeypatch.setattr(service, "start_tts_usage_metrics", fake_metrics)
 
-    await _drain(service.run_tts("धन्यवाद, आपका दिन शुभ हो।", context_id="ctx-1"))
+    await _drain(service.run_tts(text, context_id="ctx-1"))
 
-    assert sent == ["धन्यवाद, आपका दिन शुभ हो।"]
+    assert sent == [text]
 
 
 # --------------------------------------------------------------------------- #

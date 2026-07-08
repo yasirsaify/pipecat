@@ -1230,13 +1230,16 @@ class SarvamTTSService(InterruptibleTTSService):
         """
         logger.debug(f"Generating TTS: [{text}]")
 
-        # Sarvam rejects text with no synthesizable characters (e.g. a lone
-        # quote or whitespace) with "400: Text must contain at least one
-        # character from the allowed languages.", which also tears down the
+        # Sarvam rejects text with no character from a supported language
+        # (e.g. a lone quote, whitespace, or a digits/punctuation-only chunk
+        # like a bare list marker "1.") with "400: Text must contain at least
+        # one character from the allowed languages.", which also tears down the
         # websocket and forces a reconnect. Sentence aggregation can isolate
-        # such fragments (a trailing closing quote becoming its own chunk),
-        # so skip them here rather than letting the API error out.
-        if not any(ch.isalnum() for ch in text):
+        # such fragments (a trailing closing quote or an enumeration number
+        # becoming its own chunk), so skip them here rather than letting the API
+        # error out. Note: the check is isalpha(), not isalnum() — Sarvam needs
+        # an actual letter, so a digit-only chunk still fails the language check.
+        if not any(ch.isalpha() for ch in text):
             logger.debug(f"Skipping TTS for text with no synthesizable characters: [{text}]")
             return
 
