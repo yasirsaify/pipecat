@@ -1003,23 +1003,36 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if self._summarizer:
             await self._summarizer.setup(self.task_manager)
 
-    async def push_aggregation(self) -> str:
+    async def push_aggregation(self, check_phantom: bool = True) -> str:
         """Push the current assistant aggregation with timestamp.
 
         Suppresses "phantom" turns: aggregations whose TTS output never
         actually reached the user (e.g. killed by an interruption between
-        TTS first-byte and the output transport, or by a slow upstream TTS
-        timing out before any audio frame was written). Such turns would
+        TTS first-byte and the output transport). Such turns would
         otherwise pollute the LLM context and conversation logs with
         content the user never heard. Detection: BotStartedSpeakingFrame
         was never observed since the last reset.
+
+        Args:
+            check_phantom: Whether to apply the phantom-turn check. Callers
+                triggered by ordinary end-of-generation (no interruption)
+                should pass False: BotStartedSpeakingFrame is emitted much
+                further downstream (after the text reaches TTS, gets
+                synthesized, and reaches the output transport), so for
+                short responses LLMFullResponseEndFrame routinely arrives
+                before BotStartedSpeakingFrame even on turns that go on to
+                play normally. Checking here would drop those turns as
+                false-positive phantoms. The check remains meaningful only
+                when triggered by an actual InterruptionFrame, where a
+                missing BotStartedSpeakingFrame genuinely indicates the
+                turn was cut off before any audio was heard.
         """
         if not self._aggregation:
             return ""
 
         aggregation = self.aggregation_string()
 
-        if aggregation and not self._bot_started_speaking_since_reset:
+        if check_phantom and aggregation and not self._bot_started_speaking_since_reset:
             # Phantom turn — bot never actually spoke this aggregation.
             # Drop it on the floor: do not commit to context, do not fire
             # on_assistant_turn_stopped. The reset() below clears state so
@@ -1222,7 +1235,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
         await self._trigger_assistant_turn_started()
 
     async def _handle_llm_end(self, _: LLMFullResponseEndFrame):
-        await self._trigger_assistant_turn_stopped()
+        # Not check_phantom=True here: this fires the instant the LLM stops
+        # streaming text, which for short responses can easily be before
+        # BotStartedSpeakingFrame arrives from TTS/the output transport even
+        # when the turn goes on to play normally. See push_aggregation().
+        await self._trigger_assistant_turn_stopped(check_phantom=False)
 
     async def _handle_text(self, frame: TextFrame):
         # Skip TextFrame types not intended to build the assistant context
@@ -1314,8 +1331,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         await self._call_event_handler("on_assistant_turn_started")
 
-    async def _trigger_assistant_turn_stopped(self):
-        aggregation = await self.push_aggregation()
+    async def _trigger_assistant_turn_stopped(self, check_phantom: bool = True):
+        aggregation = await self.push_aggregation(check_phantom=check_phantom)
         if aggregation:
             # Strip turn completion markers from the transcript
             content = self._maybe_strip_turn_completion_markers(aggregation)

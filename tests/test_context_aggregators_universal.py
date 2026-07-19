@@ -635,6 +635,74 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stop_messages[0].content, "Hello")
         self.assertEqual(stop_messages[1].content, "Hello there!")
 
+    async def test_short_response_committed_without_bot_started_speaking(self):
+        """Ordinary (non-interrupted) completion must not be dropped as phantom.
+
+        Short responses can finish generating before TTS ever starts
+        synthesizing, so BotStartedSpeakingFrame may not have arrived yet
+        when LLMFullResponseEndFrame fires. That must not cause the turn
+        to be dropped (check_phantom=False on the _handle_llm_end path).
+        """
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        stop_messages = []
+
+        @aggregator.event_handler("on_assistant_turn_stopped")
+        async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+            stop_messages.append(message)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Sure, one moment."),
+            LLMFullResponseEndFrame(),
+            # No BotStartedSpeakingFrame -- TTS hasn't started yet.
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(stop_messages), 1)
+        self.assertEqual(stop_messages[0].content, "Sure, one moment.")
+
+    async def test_known_limitation_late_interruption_does_not_retract(self):
+        """Documents a known gap left open by check_phantom=False.
+
+        Once _handle_llm_end commits a turn (check_phantom=False),
+        push_aggregation() has already reset self._aggregation to empty.
+        A later InterruptionFrame for that same turn therefore can't
+        retract it -- _handle_interruptions's phantom check (still
+        check_phantom=True) finds nothing left to drop. If the bot is cut
+        off between LLMFullResponseEndFrame and BotStartedSpeakingFrame,
+        the turn is incorrectly kept instead of dropped.
+
+        This is intentionally asserting the CURRENT (imperfect) behavior,
+        not the desired one. If a future fix retracts an already-committed
+        message on a late interruption, update this test.
+        """
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        stop_messages = []
+
+        @aggregator.event_handler("on_assistant_turn_stopped")
+        async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+            stop_messages.append(message)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Sure, one moment."),
+            LLMFullResponseEndFrame(),
+            # No BotStartedSpeakingFrame -- TTS never got a chance to play
+            # this before the user (or something else) interrupts.
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        # KNOWN LIMITATION: this "should" be 0 (never heard, should be
+        # dropped) but is 1 -- see docstring above.
+        self.assertEqual(len(stop_messages), 1)
+        self.assertEqual(stop_messages[0].content, "Sure, one moment.")
+
     async def test_thought(self):
         context = LLMContext()
 
