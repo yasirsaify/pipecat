@@ -1,0 +1,1 @@
+Compacted the JSON serialization of OpenAI tool-call arguments and tool results in the LLM context (no `", "`/`": "` whitespace via `separators=(",", ":")`). These messages are re-sent on every subsequent turn, so this reduces prompt tokens on tool-heavy conversations with no change to the data (`ensure_ascii=False` preserved so non-ASCII text is not `\u`-escaped).
