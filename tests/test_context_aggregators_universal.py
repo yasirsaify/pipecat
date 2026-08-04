@@ -4,12 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import json
 import unittest
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     FunctionCallFromLLM,
+    FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     InterimTranscriptionFrame,
@@ -797,6 +799,70 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         # The incomplete marker should be stripped (resulting in empty content)
         self.assertEqual(len(stop_messages), 1)
         self.assertEqual(stop_messages[0].content, "")
+
+    async def test_function_call_context_uses_compact_json(self):
+        """Tool-call arguments and results must serialize without whitespace.
+
+        Both messages are re-sent in the context on every subsequent turn, so the
+        default ", "/": " separators are pure repeated token overhead. A previous
+        fix applied this only to the deprecated OpenAIAssistantContextAggregator,
+        leaving this (the aggregator actually used) unchanged — this test pins the
+        behaviour to the class that is really in the pipeline.
+        """
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        arguments = {"query": "जिम्मेदारी सिर्फ", "size": "250 mL", "quantity": 5}
+        result = {"found": True, "confidence": "low", "matches": [{"product_base": "SARIVA"}]}
+
+        frames_to_send = [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="search_product",
+                        tool_call_id="1",
+                        arguments=arguments,
+                        context=None,
+                    )
+                ]
+            ),
+            FunctionCallInProgressFrame(
+                function_name="search_product",
+                tool_call_id="1",
+                arguments=arguments,
+            ),
+            SleepFrame(),
+            FunctionCallResultFrame(
+                function_name="search_product",
+                tool_call_id="1",
+                arguments=arguments,
+                result=result,
+            ),
+            SleepFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        serialized = [
+            m["tool_calls"][0]["function"]["arguments"]
+            for m in context.messages
+            if isinstance(m, dict) and m.get("tool_calls")
+        ] + [
+            m["content"]
+            for m in context.messages
+            if isinstance(m, dict) and m.get("role") == "tool"
+        ]
+        self.assertEqual(len(serialized), 2, f"expected args+result, got {context.messages}")
+
+        for blob in serialized:
+            self.assertNotIn(", ", blob)
+            self.assertNotIn(": ", blob)
+            # Non-ASCII must not be \u-escaped — that would multiply token cost.
+            self.assertNotIn("\\u", blob)
+
+        # Round-trips to the same data: only whitespace was removed.
+        self.assertEqual(json.loads(serialized[0]), arguments)
+        self.assertEqual(json.loads(serialized[1]), result)
+        self.assertIn("जिम्मेदारी", serialized[0])
 
 
 if __name__ == "__main__":
