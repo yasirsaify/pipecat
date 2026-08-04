@@ -1109,7 +1109,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
                         "id": frame.tool_call_id,
                         "function": {
                             "name": frame.function_name,
-                            "arguments": json.dumps(frame.arguments, ensure_ascii=False),
+                            # Compact separators: this assistant tool_calls
+                            # message is re-sent in the context on every
+                            # subsequent turn, so drop the default ", "/": "
+                            # whitespace.
+                            "arguments": json.dumps(
+                                frame.arguments, ensure_ascii=False, separators=(",", ":")
+                            ),
                         },
                         "type": "function",
                     }
@@ -1142,7 +1148,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         # Update context with the function call result
         if frame.result:
-            result = json.dumps(frame.result, ensure_ascii=False)
+            # Compact separators: the tool result is re-sent in the context on
+            # every subsequent turn and is typically the largest single message,
+            # so drop the default ", "/": " whitespace. ensure_ascii=False keeps
+            # non-ASCII (e.g. Devanagari) from being \u-escaped, which would
+            # multiply its token cost.
+            result = json.dumps(frame.result, ensure_ascii=False, separators=(",", ":"))
             self._update_function_call_result(frame.function_name, frame.tool_call_id, result)
         else:
             self._update_function_call_result(frame.function_name, frame.tool_call_id, "COMPLETED")
