@@ -218,6 +218,13 @@ class TTSService(AIService):
                 When True, the base class handles ``create_audio_context`` and yields ``TTSStartedFrame``
                 before each synthesis call, so ``run_tts`` implementations do not need to.
             stop_frame_timeout_s: Idle time before pushing TTSStoppedFrame when push_stop_frames is True.
+                Also the TTFB budget: the wait for the *first* audio chunk of a context. If it
+                expires the context is discarded and the utterance is never spoken, so size it
+                to the provider's tail latency, not its median.
+            audio_done_timeout_s: Idle time before finalizing a context that has already produced
+                audio (end-of-turn detection). None keeps the single-tier behavior of using
+                stop_frame_timeout_s in both phases; set it shorter so a large TTFB budget does
+                not delay the EndFrame after the last audio chunk.
             push_silence_after_stop: Whether to push silence audio after TTSStoppedFrame.
             silence_time_s: Duration of silence to push when push_silence_after_stop is True.
             pause_frame_processing: Whether to pause frame processing during audio generation.
@@ -1405,6 +1412,14 @@ class TTSService(AIService):
         last_audio_ts = 0.0
         audio_frames = 0
         keepalives = 0
+        # Largest gap between two consecutive audio chunks in this context.
+        # `audio_done_timeout_s` finalizes a context that has already produced
+        # audio once it goes idle for that long — so a max_gap approaching it
+        # means the provider is at risk of having a *mid-utterance* pause
+        # mistaken for the end of the turn, which truncates speech. This is the
+        # measurement needed to size that timeout per provider instead of
+        # assuming one vendor's behavior generalizes.
+        max_gap_ms = 0.0
         while running:
             try:
                 # Full timeout guards the *first* audio chunk (TTFB). Once audio
@@ -1424,8 +1439,10 @@ class TTSService(AIService):
                     logger.info(
                         f"{self} teardown: audio context {context_id} finalized via "
                         f"CONTEXT END (None) — {since:.0f}ms since last audio, "
-                        f"audio_frames={audio_frames}, keepalives={keepalives}, "
-                        f"stop_frame_timeout_s={self._stop_frame_timeout_s}"
+                        f"audio_frames={audio_frames}, max_gap={max_gap_ms:.0f}ms, "
+                        f"keepalives={keepalives}, "
+                        f"stop_frame_timeout_s={self._stop_frame_timeout_s}, "
+                        f"audio_done_timeout_s={self._audio_done_timeout_s}"
                     )
                 elif isinstance(frame, _WordTimestampEntry):
                     # Route word timestamps through _add_word_timestamps so they are
@@ -1435,7 +1452,10 @@ class TTSService(AIService):
                     )
                     continue
                 elif isinstance(frame, TTSAudioRawFrame):
-                    last_audio_ts = time.monotonic()
+                    now = time.monotonic()
+                    if last_audio_ts:
+                        max_gap_ms = max(max_gap_ms, (now - last_audio_ts) * 1000.0)
+                    last_audio_ts = now
                     audio_frames += 1
                     # Set the word-timestamp baseline once, on the first audio chunk.
                     if not timestamps_started:
@@ -1461,12 +1481,27 @@ class TTSService(AIService):
                 logger.trace(f"{self} time out on audio context {context_id}")
                 since = (time.monotonic() - last_audio_ts) * 1000.0 if last_audio_ts else -1.0
                 effective_timeout = self._audio_context_timeout(audio_received=audio_frames > 0)
-                logger.info(
+                message = (
                     f"{self} teardown: audio context {context_id} finalized via "
                     f"IDLE TIMEOUT ({effective_timeout}s, audio_received={audio_frames > 0}) — "
                     f"{since:.0f}ms since last audio, "
-                    f"audio_frames={audio_frames}, keepalives={keepalives}"
+                    f"audio_frames={audio_frames}, max_gap={max_gap_ms:.0f}ms, "
+                    f"keepalives={keepalives}"
                 )
+                if audio_frames == 0:
+                    # Timing out before the FIRST chunk is not a teardown, it is
+                    # a lost utterance: the context is dropped here and anything
+                    # the provider sends afterwards is discarded as belonging to
+                    # an unavailable context, so the bot simply goes silent for a
+                    # turn with nothing in the log to say why. Say why.
+                    logger.warning(
+                        f"{message} — NO AUDIO EVER RECEIVED, this utterance was "
+                        f"dropped and will not be spoken. The provider did not "
+                        f"deliver a first chunk within the {effective_timeout}s "
+                        f"TTFB budget (stop_frame_timeout_s)."
+                    )
+                else:
+                    logger.info(message)
                 if should_push_stop_frame and self._push_stop_frames:
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     should_push_stop_frame = False
