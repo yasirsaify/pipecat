@@ -750,6 +750,18 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
             received_ctx_id = msg.get("contextId")
 
+            # Surface provider-side failures. Without this the loop silently
+            # drops anything that is not audio/alignment/isFinal, so a rejected
+            # output_format, an exhausted quota or an invalid voice produces a
+            # context that never receives a chunk, times out, and takes the
+            # utterance with it — leaving no trace at any log level of why the
+            # bot went quiet.
+            if msg.get("error") or msg.get("code") is not None:
+                await self.push_error(
+                    f"{self} ElevenLabs error for context {received_ctx_id}: {msg}"
+                )
+                continue
+
             # Handle final messages first, regardless of context availability
             # At the moment, this message is received AFTER the close_context message is
             # sent, so it doesn't serve any functional purpose. For now, we'll just log it.
@@ -775,6 +787,14 @@ class ElevenLabsTTSService(WebsocketTTSService):
                 audio = base64.b64decode(msg["audio"])
                 frame = TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=received_ctx_id)
                 await self.append_to_audio_context(received_ctx_id, frame)
+            elif not msg.get("alignment") and not msg.get("normalizedAlignment"):
+                # Neither audio nor alignment: a message shape we do not handle.
+                # Log the keys rather than dropping it, so the next unexplained
+                # silent turn has something to go on.
+                logger.warning(
+                    f"{self}: unhandled ElevenLabs message for context "
+                    f"{received_ctx_id}, keys={sorted(msg.keys())}"
+                )
 
             if msg.get("alignment"):
                 alignment = msg["alignment"]
