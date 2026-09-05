@@ -338,62 +338,89 @@ async def test_process_messages_surfaces_errors(monkeypatch):
     service._configured_streams.add("ctx-1")
 
     errors = []
-    pushed = []
+    appended = []
+    removed = []
 
     async def fake_push_error(error_msg, **kwargs):
         errors.append(error_msg)
 
-    async def fake_push_frame(frame, *args, **kwargs):
-        pushed.append(frame)
+    async def fake_append(ctx, frame):
+        appended.append((ctx, frame))
+
+    async def fake_remove(ctx):
+        removed.append(ctx)
 
     async def noop(*args, **kwargs):
         pass
 
     monkeypatch.setattr(service, "push_error", fake_push_error)
-    monkeypatch.setattr(service, "push_frame", fake_push_frame)
+    monkeypatch.setattr(service, "append_to_audio_context", fake_append)
+    monkeypatch.setattr(service, "remove_audio_context", fake_remove)
+    monkeypatch.setattr(service, "audio_context_available", lambda ctx: True)
     monkeypatch.setattr(service, "stop_all_metrics", noop)
-    monkeypatch.setattr(service, "reset_active_audio_context", lambda: None)
 
     await service._process_messages()
 
     assert len(errors) == 1
     assert "invalid_request" in errors[0]
     assert "Missing model" in errors[0]
-    assert any(isinstance(f, TTSStoppedFrame) for f in pushed)
+    assert any(isinstance(f, TTSStoppedFrame) for _, f in appended)
+    assert removed == ["ctx-1"]
     assert "ctx-1" not in service._configured_streams
 
 
 @pytest.mark.asyncio
-async def test_stream_limit_triggers_reconnect(monkeypatch):
-    """Opening more than 5 concurrent streams reconnects instead of being rejected.
+async def test_orphaned_streams_are_cancelled_not_reconnected(monkeypatch):
+    """A context finalized by the base class's TTFB/idle timeout never reaches
+    flush_audio, so its Soniox stream is never closed and stays metered for the
+    rest of the call. Opening the next stream sweeps those away.
 
-    Soniox refuses the config message once a connection is at its stream limit,
-    which would silently drop the utterance.
+    Reconnecting to shed them (the obvious alternative) would run
+    remove_active_audio_context and take the live utterance down with it.
     """
     service = _make_service()
     ws = FakeWebsocket()
     service._websocket = ws
+    service._configured_streams.update({"dead-1", "dead-2", "live-1"})
 
-    reconnects = []
+    monkeypatch.setattr(service, "audio_context_available", lambda ctx: ctx == "live-1")
+
+    await service._ensure_stream_configured("new-1")
+
+    cancels = sorted(m["stream_id"] for m in ws.sent if m.get("cancel"))
+    assert cancels == ["dead-1", "dead-2"]
+    # The live stream is untouched and the new one is configured.
+    assert service._configured_streams == {"live-1", "new-1"}
+    assert [m["stream_id"] for m in ws.sent_of_kind("api_key")] == ["new-1"]
+
+
+@pytest.mark.asyncio
+async def test_stream_cap_does_not_tear_down_live_streams(monkeypatch):
+    """At the cap with every stream live there is nothing safe to shed.
+
+    Soniox fails just the new stream rather than the connection, which arrives
+    on the error path — a better outcome than cutting off whatever is speaking.
+    """
+    service = _make_service()
+    ws = FakeWebsocket()
+    service._websocket = ws
+    live = {f"live-{i}" for i in range(SONIOX_MAX_CONCURRENT_STREAMS)}
+    service._configured_streams.update(live)
+
+    monkeypatch.setattr(service, "audio_context_available", lambda ctx: True)
+
+    disconnected = []
 
     async def fake_disconnect():
-        reconnects.append("disconnect")
-        service._configured_streams.clear()
-
-    async def fake_connect():
-        reconnects.append("connect")
+        disconnected.append(True)
 
     monkeypatch.setattr(service, "_disconnect_websocket", fake_disconnect)
-    monkeypatch.setattr(service, "_connect_websocket", fake_connect)
 
-    for i in range(SONIOX_MAX_CONCURRENT_STREAMS):
-        await service._ensure_stream_configured(f"ctx-{i}")
-    assert reconnects == []
+    await service._ensure_stream_configured("new-1")
 
-    await service._ensure_stream_configured("ctx-overflow")
-
-    assert reconnects == ["disconnect", "connect"]
-    assert service._configured_streams == {"ctx-overflow"}
+    assert disconnected == [], "must not reconnect: it would kill the live utterance"
+    assert ws.sent_of_kind("cancel") == []
+    assert service._configured_streams == live | {"new-1"}
 
 
 @pytest.mark.asyncio
@@ -415,3 +442,71 @@ async def test_disconnect_clears_configured_streams():
 
     assert service._configured_streams == set()
     assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_error_for_a_finished_stream_does_not_disturb_the_live_one(monkeypatch):
+    """Soniox fails one stream without closing the connection, so a late error
+    for a stream we already finished must not tear down what is speaking now.
+
+    The earlier version reset the active audio context here, nulling the
+    playback cursor of an unrelated, live context.
+    """
+    ws = FakeWebsocket(
+        inbound=[
+            {
+                "stream_id": "ctx-old",
+                "error_code": 400,
+                "error_type": "invalid_request",
+                "error_message": "too late",
+            }
+        ]
+    )
+    service = _make_service()
+    service._websocket = ws
+    service._configured_streams.add("ctx-live")  # ctx-old already finished
+
+    errors = []
+    appended = []
+    removed = []
+    resets = []
+
+    async def fake_push_error(error_msg, **kwargs):
+        errors.append(error_msg)
+
+    async def fake_append(ctx, frame):
+        appended.append((ctx, frame))
+
+    async def fake_remove(ctx):
+        removed.append(ctx)
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(service, "push_error", fake_push_error)
+    monkeypatch.setattr(service, "append_to_audio_context", fake_append)
+    monkeypatch.setattr(service, "remove_audio_context", fake_remove)
+    monkeypatch.setattr(service, "audio_context_available", lambda ctx: True)
+    monkeypatch.setattr(service, "stop_all_metrics", noop)
+    monkeypatch.setattr(service, "reset_active_audio_context", lambda: resets.append(True))
+
+    await service._process_messages()
+
+    # The error is still surfaced...
+    assert len(errors) == 1
+    # ...but nothing about the live stream is touched.
+    assert appended == []
+    assert removed == []
+    assert resets == []
+    assert service._configured_streams == {"ctx-live"}
+
+
+def test_init_time_regional_language_is_resolved_to_a_base_code():
+    """Soniox takes a bare ISO code; a regional one is rejected.
+
+    TTSService.__init__ converts after apply_update, so settings passed at
+    construction are normalised the same way a runtime update would be.
+    """
+    service = _make_service(settings=SonioxTTSSettings(language=Language.EN_US))
+    assert service._settings.language == "en"
+    assert json.loads(service._build_config_msg("ctx-1"))["language"] == "en"

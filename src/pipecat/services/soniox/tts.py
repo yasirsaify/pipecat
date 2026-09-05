@@ -352,22 +352,51 @@ class SonioxTTSService(WebsocketTTSService):
             return self._websocket
         raise Exception("Websocket not connected")
 
+    async def _cancel_stream(self, stream_id: str):
+        """Cancel one Soniox stream and forget it, tolerating a dead socket."""
+        self._configured_streams.discard(stream_id)
+        try:
+            await self._get_websocket().send(json.dumps({"stream_id": stream_id, "cancel": True}))
+        except Exception as e:
+            logger.debug(f"{self}: failed to cancel Soniox stream {stream_id}: {e}")
+
+    async def _cancel_orphaned_streams(self):
+        """Cancel streams whose audio context is already gone.
+
+        Not every context reaches ``flush_audio``: one finalized by the base
+        class's TTFB or idle timeout is dropped without it, so no ``text_end``
+        is ever sent, Soniox never answers ``audio_end``, and the stream stays
+        open — metered for the rest of the call, and counting against the
+        per-connection cap. Sweeping them here is what keeps that cap out of
+        reach; reconnecting to shed them would take the live utterance down
+        with them.
+        """
+        orphans = [
+            stream_id
+            for stream_id in self._configured_streams
+            if not self.audio_context_available(stream_id)
+        ]
+        for stream_id in orphans:
+            logger.debug(f"{self}: cancelling orphaned Soniox stream {stream_id}")
+            await self._cancel_stream(stream_id)
+
     async def _ensure_stream_configured(self, stream_id: str):
         """Open the Soniox stream for this context if it isn't open already."""
         if stream_id in self._configured_streams:
             return
 
+        await self._cancel_orphaned_streams()
+
         if len(self._configured_streams) >= SONIOX_MAX_CONCURRENT_STREAMS:
-            # Soniox rejects the config message once the connection is at its
-            # stream limit, which would silently cost us an utterance. Drop the
-            # stalest ids we know about by reconnecting — every live context
-            # re-sends its config on the next text chunk.
+            # Every remaining stream still has a live context, so there is
+            # nothing safe to shed. Soniox fails just this stream rather than
+            # the connection, and that arrives on the error path — which is a
+            # better outcome than cutting off whatever is currently speaking.
             logger.warning(
-                f"{self}: {len(self._configured_streams)} Soniox streams already open on "
-                f"this connection (limit {SONIOX_MAX_CONCURRENT_STREAMS}); reconnecting"
+                f"{self}: {len(self._configured_streams)} Soniox streams open on this "
+                f"connection (limit {SONIOX_MAX_CONCURRENT_STREAMS}); "
+                f"stream {stream_id} may be rejected"
             )
-            await self._disconnect_websocket()
-            await self._connect_websocket()
 
         await self._get_websocket().send(self._build_config_msg(stream_id))
         self._configured_streams.add(stream_id)
@@ -376,13 +405,7 @@ class SonioxTTSService(WebsocketTTSService):
         """Cancel the Soniox stream when the bot is interrupted."""
         await self.stop_all_metrics()
         if context_id and context_id in self._configured_streams:
-            self._configured_streams.discard(context_id)
-            try:
-                await self._get_websocket().send(
-                    json.dumps({"stream_id": context_id, "cancel": True})
-                )
-            except Exception as e:
-                logger.debug(f"{self}: failed to cancel Soniox stream {context_id}: {e}")
+            await self._cancel_stream(context_id)
         await super().on_audio_context_interrupted(context_id)
 
     async def flush_audio(self, context_id: Optional[str] = None):
@@ -411,9 +434,6 @@ class SonioxTTSService(WebsocketTTSService):
             stream_id = msg.get("stream_id")
 
             if msg.get("error_code") is not None:
-                self._configured_streams.discard(stream_id)
-                if stream_id:
-                    await self.push_frame(TTSStoppedFrame(context_id=stream_id))
                 await self.stop_all_metrics()
                 await self.push_error(
                     error_msg=(
@@ -421,7 +441,17 @@ class SonioxTTSService(WebsocketTTSService):
                         f"({msg.get('error_type')}): {msg.get('error_message')}"
                     )
                 )
-                self.reset_active_audio_context()
+                # Tear down only the stream that actually failed. Soniox fails
+                # one stream without closing the connection, so an error for a
+                # stream we have already finished — a late error for a cancelled
+                # one, say — must not touch whatever is speaking now.
+                if stream_id and stream_id in self._configured_streams:
+                    self._configured_streams.discard(stream_id)
+                    if self.audio_context_available(stream_id):
+                        await self.append_to_audio_context(
+                            stream_id, TTSStoppedFrame(context_id=stream_id)
+                        )
+                        await self.remove_audio_context(stream_id)
                 continue
 
             if not stream_id or not self.audio_context_available(stream_id):
