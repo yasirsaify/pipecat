@@ -313,6 +313,112 @@ async def test_serialize_output_transport_message_round_trips_camelcase():
     assert parsed["streamSid"] == STREAM_SID  # camelCase preserved
 
 
+@pytest.mark.asyncio
+async def test_serialize_transfer_event_stamps_stream_id():
+    """The app supplies the intent; the serializer supplies the identity.
+
+    "transfer" identifies the stream with camelCase "streamId" carrying the
+    same value as "stream_sid" — a third spelling alongside "streamSid" on
+    endOfInteraction. All three are the vendor's contract.
+    """
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    frame = OutputTransportMessageFrame(
+        message={"event": "transfer", "message": "User requested transfer"}
+    )
+
+    out = await serializer.serialize(frame)
+    assert isinstance(out, str)
+
+    parsed = json.loads(out)
+    assert parsed == {
+        "event": "transfer",
+        "streamId": STREAM_SID,
+        "message": "User requested transfer",
+        "extra_headers": "{}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_serialize_transfer_event_preserves_caller_supplied_fields():
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    frame = OutputTransportMessageFrame(
+        message={
+            "event": "transfer",
+            "streamId": "explicit-stream",
+            "message": "ESCALATE_BILLING",
+            "extra_headers": '{"X-Transfer-To": "+919876543210"}',
+        }
+    )
+
+    parsed = json.loads(await serializer.serialize(frame))
+    assert parsed["streamId"] == "explicit-stream"
+    assert parsed["extra_headers"] == '{"X-Transfer-To": "+919876543210"}'
+    assert parsed["message"] == "ESCALATE_BILLING"
+
+
+@pytest.mark.asyncio
+async def test_serialize_transfer_event_does_not_mutate_caller_dict():
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    payload = {"event": "transfer", "message": "User requested transfer"}
+    frame = OutputTransportMessageFrame(message=payload)
+
+    await serializer.serialize(frame)
+
+    # The frame the app queued must come back unchanged — a retry or a log of
+    # the same frame would otherwise carry a stream id it never set.
+    assert payload == {"event": "transfer", "message": "User requested transfer"}
+
+
+@pytest.mark.asyncio
+async def test_transfer_suppresses_the_hangup_event_for_the_rest_of_the_stream():
+    """After a hand-off this socket must never carry endOfInteraction.
+
+    ConVox owns the call once the transfer is sent. Whatever tears our
+    pipeline down afterwards — the carrier closing the WS, a duration guard,
+    an idle timer — would otherwise hang up a call that is no longer ours.
+    """
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    await serializer.serialize(
+        OutputTransportMessageFrame(message={"event": "transfer", "message": "x"})
+    )
+
+    assert await serializer.serialize(EndFrame()) is None
+
+
+@pytest.mark.asyncio
+async def test_hangup_still_fires_when_no_transfer_was_sent():
+    """The suppression must be caused by the transfer, not by setup order."""
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    out = await serializer.serialize(EndFrame())
+    assert out is not None
+    assert json.loads(out[0])["event"] == "endOfInteraction"
+
+
+@pytest.mark.asyncio
+async def test_serialize_non_transfer_message_is_verbatim_passthrough():
+    """extra_headers/streamId defaulting must not leak onto other events."""
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    payload = {"event": "endOfInteraction", "streamSid": STREAM_SID, "reason": "hangup"}
+    parsed = json.loads(
+        await serializer.serialize(OutputTransportMessageFrame(message=payload))
+    )
+    assert parsed == payload
+    assert "extra_headers" not in parsed
+    assert "streamId" not in parsed
+
+
 def _logged_messages(mock_logger, level: str) -> list[str]:
     calls = getattr(mock_logger, level).call_args_list
     return [str(c.args[0]) for c in calls if c.args]
