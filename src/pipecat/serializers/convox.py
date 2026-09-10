@@ -40,9 +40,10 @@ class ConVoxFrameSerializer(FrameSerializer):
     serializers, ConVox sends raw 16-bit PCM, not μ-law.
 
     Graceful call termination is performed in-band via an ``endOfInteraction``
-    event sent over the same WebSocket, and hand-off to a human via a
-    ``transfer`` event on that same socket. ConVox has no REST API, so no
-    external credentials are required.
+    event sent over the same WebSocket. Hand-off to a human adds a ``transfer``
+    event on that same socket *before* that termination — the transfer asks
+    ConVox to move the caller, and our leg then ends the way it always does.
+    ConVox has no REST API, so no external credentials are required.
     """
 
     class InputParams(BaseModel):
@@ -90,6 +91,9 @@ class ConVoxFrameSerializer(FrameSerializer):
         self._sequence_number = 0
         self._chunk = 0
         self._hangup_attempted = False
+        # Set when a "transfer" event has gone out, so the endOfInteraction that
+        # follows names the transfer as its reason.
+        self._transfer_sent = False
 
         self._input_resampler = create_stream_resampler()
         self._output_resampler = create_stream_resampler()
@@ -175,7 +179,11 @@ class ConVoxFrameSerializer(FrameSerializer):
                 answer = {
                     "event": "endOfInteraction",
                     "streamSid": self._stream_sid,
-                    "reason": "hangup",
+                    # "transfer" once the caller has been handed off, so the
+                    # carrier can tell a hand-off apart from a hangup in its own
+                    # logs. The interaction ends either way, which is why the
+                    # teardown itself is identical.
+                    "reason": "transfer" if self._transfer_sent else "hangup",
                     "context": {},
                 }
                 # ConVox additionally expects an explicit "stop" event after
@@ -311,20 +319,21 @@ class ConVoxFrameSerializer(FrameSerializer):
                 # add do not have to spell it out.
                 message.setdefault("extra_headers", "{}")
                 self._sequence_number += 1
-                # Once the caller has been handed off, this socket must never
-                # carry a hangup. ConVox owns the call from here, and the
-                # EndFrame that eventually tears our pipeline down — from the
-                # carrier closing the WS, a duration guard, anything — would
-                # otherwise emit endOfInteraction and drop a call that is by
-                # then someone else's. Reusing the hangup latch is what makes
-                # that true for *every* termination path rather than the ones
-                # we thought to guard.
-                self._hangup_attempted = True
+                # The transfer event is additive: it asks ConVox to hand the
+                # caller over, and our own teardown then proceeds exactly as it
+                # does for any other ending — endOfInteraction followed by stop.
+                # Record it only so that endOfInteraction can name the reason it
+                # is ending for. This marks intent to send, not delivery — the
+                # serializer only produces bytes and never learns whether the
+                # write landed. That is survivable here: a transfer that failed
+                # to write leaves a socket on which the endOfInteraction behind
+                # it will not land either, so there is no reader left to be
+                # misled by its reason.
+                self._transfer_sent = True
                 logger.info(
                     f"ConVox serializer: sending 'transfer' for stream "
                     f"{self._stream_sid}, seq={self._sequence_number}, "
-                    f"message={message.get('message')!r} — hangup suppressed "
-                    f"for the rest of this stream"
+                    f"message={message.get('message')!r}"
                 )
 
             return json.dumps(message)
