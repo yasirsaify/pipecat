@@ -376,12 +376,12 @@ async def test_serialize_transfer_event_does_not_mutate_caller_dict():
 
 
 @pytest.mark.asyncio
-async def test_transfer_suppresses_the_hangup_event_for_the_rest_of_the_stream():
-    """After a hand-off this socket must never carry endOfInteraction.
+async def test_hangup_still_follows_a_transfer():
+    """The transfer event is additive, not a substitute for termination.
 
-    ConVox owns the call once the transfer is sent. Whatever tears our
-    pipeline down afterwards — the carrier closing the WS, a duration guard,
-    an idle timer — would otherwise hang up a call that is no longer ours.
+    ConVox needs the transfer to move the caller; our own leg then ends the way
+    it always does. Suppressing endOfInteraction here would leave the media
+    stream open with nothing driving it.
     """
     serializer = _make_serializer()
     await _setup(serializer)
@@ -390,18 +390,33 @@ async def test_transfer_suppresses_the_hangup_event_for_the_rest_of_the_stream()
         OutputTransportMessageFrame(message={"event": "transfer", "message": "x"})
     )
 
-    assert await serializer.serialize(EndFrame()) is None
+    out = await serializer.serialize(EndFrame())
+    assert out is not None and len(out) == 2
+    assert json.loads(out[0])["event"] == "endOfInteraction"
+    assert json.loads(out[1])["event"] == "stop"
 
 
 @pytest.mark.asyncio
-async def test_hangup_still_fires_when_no_transfer_was_sent():
-    """The suppression must be caused by the transfer, not by setup order."""
+async def test_end_of_interaction_names_the_transfer_as_its_reason():
+    serializer = _make_serializer()
+    await _setup(serializer)
+
+    await serializer.serialize(
+        OutputTransportMessageFrame(message={"event": "transfer", "message": "x"})
+    )
+    out = await serializer.serialize(EndFrame())
+
+    assert json.loads(out[0])["reason"] == "transfer"
+
+
+@pytest.mark.asyncio
+async def test_end_of_interaction_reason_is_hangup_without_a_transfer():
     serializer = _make_serializer()
     await _setup(serializer)
 
     out = await serializer.serialize(EndFrame())
-    assert out is not None
-    assert json.loads(out[0])["event"] == "endOfInteraction"
+
+    assert json.loads(out[0])["reason"] == "hangup"
 
 
 @pytest.mark.asyncio
